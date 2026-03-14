@@ -1,0 +1,66 @@
+# -*- coding: utf-8 -*-
+"""
+config.py  ─  Shared configuration for all pipeline stages.
+
+▶ Edit BASE_DIR and USER_PREFIX, then all output paths update automatically.
+"""
+
+# ── Root directory ─────────────────────────────────────────────────────────────
+BASE_DIR    = "/content/drive/MyDrive/GenAI4Drug"
+USER_PREFIX = "Ishrak"
+
+# ── All outputs live under BASE_DIR / USER_PREFIX / Output / <subdir> ──────────
+_OUT = f"{BASE_DIR}/{USER_PREFIX}/Output"
+
+# ── Stage 1 inputs (not user-specific; shared raw data) ───────────────────────
+BASE_PDB_PATH = f"{BASE_DIR}/Dummy_data/PDB/"
+BASE_XML_PATH = f"{BASE_DIR}/Dummy_data/plip/"
+REF_CSV_PATH  = f"{BASE_DIR}/Dummy_data/BR4_PDB_Data.csv"
+
+# ── Output directories ─────────────────────────────────────────────────────────
+MASK_CALC_OUTDIR   = f"{_OUT}/PLIP_Mask_Calculation/"    # Stage 1   → JSON files
+RANDOM_MASK_OUTDIR = f"{_OUT}/Random_Mask_Calculation/"  # Stage 1.5 → JSON files
+DEBUG_DIR          = f"{_OUT}/masked_smiles_lists/"       # per-ligand debug txt
+PRED_DIR           = f"{_OUT}/predictions_txt/"           # Stage 2 raw SMILES txt
+PLOT_DIR           = f"{_OUT}/plots/"                     # Stage 2 incremental PNGs
+TEST_DIR           = f"{_OUT}/test/"                      # Stage 2 --test (wiped each run)
+
+# ── Stage 1 ligands ────────────────────────────────────────────────────────────
+PIPELINE_INPUTS = [
+    {"pdb_path": BASE_PDB_PATH + "4QZS", "plip_xml_path": BASE_XML_PATH + "4QZS",
+     "resname": "JQ1", "chain": "A", "resseq": 201},
+    {"pdb_path": BASE_PDB_PATH + "3MXF", "plip_xml_path": BASE_XML_PATH + "3MXF",
+     "resname": "JQ1", "chain": "A", "resseq": 1},
+    {"pdb_path": BASE_PDB_PATH + "3ZYU", "plip_xml_path": BASE_XML_PATH + "3ZYU",
+     "resname": "1GH", "chain": "A", "resseq": 1173},
+    {"pdb_path": BASE_PDB_PATH + "3P5O", "plip_xml_path": BASE_XML_PATH + "3P5O",
+     "resname": "EAM", "chain": "A", "resseq": 1},
+    {"pdb_path": BASE_PDB_PATH + "5HLS", "plip_xml_path": BASE_XML_PATH + "5HLS",
+     "resname": "62G", "chain": "A", "resseq": 201},
+]
+
+INCLUDE_TYPES = [
+    "hydrophobic", "hbond", "waterBridge",
+    "saltBridge", "piStacking", "piCation", "halogen", "metal",
+]
+
+# ── ChemBERTa model ────────────────────────────────────────────────────────────
+CHEMBERTA_MODEL = "seyonec/ChemBERTa-zinc-base-v1"
+
+# ── Stage 1.5: random masking knobs ───────────────────────────────────────────
+RANDOM_MASK_SEED = 42
+
+# ── Stage 2: incremental generation knobs ─────────────────────────────────────
+# ChemBERTa samples per (ligand × mask_count × strategy) cell.
+# Total forward passes = sum_over_ligands(N_i × 2) × INCREMENTAL_NUM_SAMPLES
+# Recommended range: 100 (fast/test) – 500 (publication quality).
+INCREMENTAL_NUM_SAMPLES = 200
+TOP_K                   = 10
+TEMPERATURE             = 1.0
+
+# ── Stage 2 (legacy full-mask knobs, kept for backward compatibility) ──────────
+N_RANDOM_MASKED       = 20
+MAX_MASKS_PER_INPUT   = 20
+NUM_SAMPLES_PER_INPUT = 10
+FULL_NUM_SAMPLES      = max(N_RANDOM_MASKED * NUM_SAMPLES_PER_INPUT, 2000)
+GROUP_SEP             = " | "

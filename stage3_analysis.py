@@ -1,0 +1,811 @@
+# -*- coding: utf-8 -*-
+"""
+stage3_analysis.py
+==================
+Stage 3 of the pipeline — post-generation analysis.
+
+Reads Stage-2 prediction txt files and Stage-1 JSON files, then for each
+ligand produces:
+
+  Aggregated level  (always):
+    • molecule_grid.png        — all unique valid SMILES drawn together
+    • histogram_pairwise.png   — Tanimoto similarity of every pair within the set
+    • histogram_vs_original.png — Tanimoto similarity of each molecule vs the
+                                  original (unmasked) ligand SMILES
+
+  Per-mask-count level  (if user requests):
+    Same three files, one set per mask_count step (1 … N).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ASSUMPTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+A1.  Similarity metric: Tanimoto on Morgan fingerprints (radius=2, 2048 bits).
+
+A2.  "Pairwise histogram" requires at least 2 molecules in the pool.
+     If fewer than 2 are present, the pairwise histogram is skipped and
+     a warning is printed.
+
+A3.  Molecule grid is capped at MAX_GRID_MOLS (default 50) to keep image
+     size reasonable. If the pool exceeds this cap, the first 50 are drawn
+     and a warning is printed. Similarity analysis always uses the full pool.
+
+A4.  The original ligand SMILES is read from the Stage-1 .meta.json files
+     in config.MASK_CALC_OUTDIR, matched to each ligand by the key
+     "{resname}-{chain}-{resseq}". If no Stage-1 JSON is found for a ligand
+     the "vs original" histogram is skipped with a warning.
+
+A5.  IA and random SMILES are pooled per group. Deduplication (Option A)
+     means each unique SMILES string is counted once regardless of which
+     strategy produced it.
+
+A6.  Ligand folders under config.PRED_DIR are discovered by listing
+     sub-directories. Each sub-directory name is treated as a ligand ID.
+     Files matching ia_mask*.txt and rand_mask*.txt are read.
+
+A7.  Each txt file produced by Stage 2 contains one SMILES per line
+     (plus an optional header line starting with a letter that is not
+     a valid SMILES start — skipped automatically by RDKit validation).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+HOW TO RUN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  python stage3_analysis.py
+
+Must be run AFTER stage2_molecule_generation.py.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+HOW TO TEST
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  python stage3_analysis.py --test
+
+Creates synthetic Stage-2 prediction files for two ligands (aspirin,
+caffeine) with hard-coded SMILES, runs the full analysis, and checks that
+all expected output files were produced.
+"""
+
+import glob
+import json
+import os
+import re
+import sys
+from itertools import combinations
+from typing import Dict, List, Optional, Tuple
+
+import matplotlib
+matplotlib.use("Agg")   # non-interactive backend — safe in Colab and headless environments
+import matplotlib.pyplot as plt
+import numpy as np
+from PIL import Image
+from rdkit import Chem
+from rdkit.Chem import AllChem, Draw
+from rdkit.Chem import rdFingerprintGenerator
+from rdkit.DataStructs import TanimotoSimilarity
+
+import config
+
+# ────────────────────────────────────────────────────────────────────────────
+MAX_GRID_MOLS = 50   # Assumption A3
+# ────────────────────────────────────────────────────────────────────────────
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  INTERACTIVE PROMPTS
+# ════════════════════════════════════════════════════════════════════════════
+
+def _ask_yes_no_default(question: str, default: bool) -> bool:
+    """
+    Prompt the user with a yes/no question.
+    Pressing Enter without typing accepts `default`.
+    Loops until a valid answer is given.
+    """
+    hint = "[Y/n]" if default else "[y/N]"
+    while True:
+        raw = input(f"  {question} {hint}: ").strip().lower()
+        if raw == "":
+            return default
+        if raw in ("yes", "y"):
+            return True
+        if raw in ("no", "n"):
+            return False
+        print("    Please type 'yes' / 'y' or 'no' / 'n', or press Enter for the default.")
+
+
+def ask_runtime_options() -> Tuple[bool, bool]:
+    """
+    Ask the two design questions at runtime.
+    Returns (per_mask_count_outputs, deduplicate).
+    Defaults: True, True.
+    """
+    print("\n" + "─" * 60)
+    print("STAGE 3 OPTIONS")
+    print("─" * 60)
+
+    print("""
+  Option 1 — Per-mask-count outputs:
+    In addition to one aggregated analysis per ligand (all mask counts
+    pooled), Stage 3 can also produce a separate grid + histograms for
+    every individual mask-count step (mask_count = 1, 2, … N).
+    This gives fine-grained insight into how generation quality changes
+    as more atoms are masked, but produces N extra image sets per ligand
+    (potentially 20+ files for a ligand with many interaction sites).
+    Default: YES.
+""")
+    per_mask = _ask_yes_no_default(
+        "Generate per-mask-count outputs in addition to aggregated?",
+        default=True,
+    )
+
+    print("""
+  Option 2 — Deduplication when pooling IA + random SMILES:
+    When combining interaction-aware and random predictions into one pool,
+    the same SMILES string might appear in both. Deduplication counts it
+    once (reflecting true unique chemical diversity). Keeping both copies
+    preserves the information that two strategies independently found the
+    same molecule, but introduces duplicates in the grid and similarity
+    scores.
+    Default: YES (deduplicate).
+""")
+    deduplicate = _ask_yes_no_default(
+        "Deduplicate pooled IA + random SMILES?",
+        default=True,
+    )
+
+    print(f"\n  Settings confirmed:")
+    print(f"    Per-mask-count outputs : {'yes' if per_mask else 'no'}")
+    print(f"    Deduplicate pool       : {'yes' if deduplicate else 'no'}")
+    print("─" * 60 + "\n")
+    return per_mask, deduplicate
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  DATA LOADING
+# ════════════════════════════════════════════════════════════════════════════
+
+def load_stage1_smiles(mask_calc_dir: str) -> Dict[str, str]:
+    """
+    Load original ligand SMILES from Stage-1 .meta.json files.
+    Returns {ligand_id: original_smiles}.
+    """
+    result: Dict[str, str] = {}
+    for path in sorted(glob.glob(os.path.join(mask_calc_dir, "*.json"))):
+        try:
+            with open(path, encoding="utf-8") as f:
+                meta = json.load(f)
+            lig  = meta.get("ligand", {})
+            key  = f"{lig.get('resname','?')}-{lig.get('chain','?')}-{lig.get('resseq','?')}"
+            smi  = meta.get("smiles", "")
+            if smi and Chem.MolFromSmiles(smi) is not None:
+                result[key] = smi
+        except Exception as e:
+            print(f"  ⚠️  Could not read Stage-1 JSON {os.path.basename(path)}: {e}")
+    return result
+
+
+def _read_smiles_from_txt(path: str) -> List[str]:
+    """
+    Read valid SMILES (one per line) from a Stage-2 prediction txt file.
+    Lines that RDKit cannot parse are silently skipped (Assumption A7).
+    """
+    valid = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                smi = line.strip()
+                if smi and Chem.MolFromSmiles(smi) is not None:
+                    valid.append(smi)
+    except Exception as e:
+        print(f"  ⚠️  Could not read {path}: {e}")
+    return valid
+
+
+def load_ligand_predictions(
+    lig_dir: str,
+) -> Dict[int, Dict[str, List[str]]]:
+    """
+    Discover ia_mask*.txt and rand_mask*.txt files under lig_dir.
+    Returns {mask_count: {"ia": [smiles…], "rand": [smiles…]}}.
+    """
+    result: Dict[int, Dict[str, List[str]]] = {}
+
+    ia_pattern   = os.path.join(lig_dir, "ia_mask*.txt")
+    rand_pattern = os.path.join(lig_dir, "rand_mask*.txt")
+
+    def _extract_count(path: str) -> Optional[int]:
+        m = re.search(r"mask(\d+)\.txt$", os.path.basename(path))
+        return int(m.group(1)) if m else None
+
+    for path in sorted(glob.glob(ia_pattern)):
+        mc = _extract_count(path)
+        if mc is None:
+            continue
+        result.setdefault(mc, {"ia": [], "rand": []})
+        result[mc]["ia"] = _read_smiles_from_txt(path)
+
+    for path in sorted(glob.glob(rand_pattern)):
+        mc = _extract_count(path)
+        if mc is None:
+            continue
+        result.setdefault(mc, {"ia": [], "rand": []})
+        result[mc]["rand"] = _read_smiles_from_txt(path)
+
+    return result
+
+
+def pool_smiles(
+    ia_list: List[str],
+    rand_list: List[str],
+    deduplicate: bool,
+) -> List[str]:
+    """
+    Combine IA and random SMILES into one list.
+    If deduplicate=True, each unique SMILES string appears once (Assumption A5).
+    """
+    combined = ia_list + rand_list
+    if deduplicate:
+        seen, out = set(), []
+        for smi in combined:
+            if smi not in seen:
+                seen.add(smi)
+                out.append(smi)
+        return out
+    return combined
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  FINGERPRINTS & SIMILARITY
+# ════════════════════════════════════════════════════════════════════════════
+
+def _morgan_fp(smiles: str):
+    """Return Morgan fingerprint (r=2, 2048 bits) or None if SMILES invalid."""
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+    gen = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
+    return gen.GetFingerprint(mol)
+
+
+def pairwise_tanimoto(smiles_list: List[str]) -> List[float]:
+    """
+    Compute Tanimoto similarity for every unique pair in smiles_list.
+    Returns a flat list of scores.
+    """
+    fps = [_morgan_fp(s) for s in smiles_list]
+    fps = [fp for fp in fps if fp is not None]
+    scores = []
+    for fp_a, fp_b in combinations(fps, 2):
+        scores.append(TanimotoSimilarity(fp_a, fp_b))
+    return scores
+
+
+def vs_original_tanimoto(smiles_list: List[str], original_smiles: str) -> List[float]:
+    """
+    Compute Tanimoto similarity of each molecule in smiles_list against
+    the original ligand SMILES.
+    """
+    orig_fp = _morgan_fp(original_smiles)
+    if orig_fp is None:
+        return []
+    scores = []
+    for smi in smiles_list:
+        fp = _morgan_fp(smi)
+        if fp is not None:
+            scores.append(TanimotoSimilarity(orig_fp, fp))
+    return scores
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  DRAWING
+# ════════════════════════════════════════════════════════════════════════════
+
+def draw_molecule_grid(
+    smiles_list: List[str],
+    title: str,
+    out_path: str,
+    mols_per_row: int = 5,
+) -> bool:
+    """
+    Draw smiles_list as a molecule grid. Saves PNG to out_path.
+    Returns True on success, False if no drawable molecules.
+    """
+    mols, legends = [], []
+    for smi in smiles_list:
+        mol = Chem.MolFromSmiles(smi)
+        if mol is not None:
+            mols.append(mol)
+            legends.append(smi[:30] + ("…" if len(smi) > 30 else ""))
+
+    if not mols:
+        print(f"    ⚠️  No drawable molecules for '{title}'. Grid skipped.")
+        return False
+
+    if len(mols) > MAX_GRID_MOLS:
+        print(
+            f"    ⚠️  Pool has {len(mols)} molecules; grid capped at {MAX_GRID_MOLS} "
+            f"(Assumption A3). Similarity analysis uses full pool."
+        )
+        mols    = mols[:MAX_GRID_MOLS]
+        legends = legends[:MAX_GRID_MOLS]
+
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+
+    # NOTE (Colab/local): MolsToGridImage return type varies by RDKit version.
+    # Four-branch guard confirmed working across Colab and local environments.
+    result = Draw.MolsToGridImage(
+        mols,
+        molsPerRow=mols_per_row,
+        subImgSize=(300, 300),
+        legends=legends,
+    )
+    if isinstance(result, bytes):
+        png_bytes = result
+    elif hasattr(result, "save"):          # PIL Image
+        buf = io.BytesIO()
+        result.save(buf, format="PNG")
+        png_bytes = buf.getvalue()
+    elif hasattr(result, "data"):           # IPython.display.Image (Colab)
+        png_bytes = result.data
+    else:
+        raise TypeError(
+            f"Unexpected image type returned by RDKit: {type(result)}"
+        )
+    with open(out_path, "wb") as f:
+        f.write(png_bytes)
+    return True
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  HISTOGRAMS
+# ════════════════════════════════════════════════════════════════════════════
+
+def _save_histogram(
+    scores: List[float],
+    xlabel: str,
+    title: str,
+    out_path: str,
+    color: str,
+    n_total_mols: int,
+) -> bool:
+    """
+    Plot and save a histogram of Tanimoto scores.
+    Returns True on success.
+    """
+    if not scores:
+        print(f"    ⚠️  No similarity scores for '{title}'. Histogram skipped.")
+        return False
+
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.hist(scores, bins=min(20, max(5, len(scores) // 3)),
+            color=color, edgecolor="white", alpha=0.85)
+    ax.set_xlabel(xlabel, fontsize=12)
+    ax.set_ylabel("Count", fontsize=12)
+    ax.set_xlim(0, 1)
+    ax.set_title(
+        f"{title}\n(n molecules = {n_total_mols}, n scores = {len(scores)})",
+        fontsize=12,
+    )
+    ax.grid(True, linestyle="--", alpha=0.4)
+    mean_val = float(np.mean(scores))
+    ax.axvline(mean_val, color="red", linestyle="--", linewidth=1.5,
+               label=f"mean = {mean_val:.3f}")
+    ax.legend(fontsize=10)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
+def plot_pairwise_histogram(
+    smiles_list: List[str],
+    title: str,
+    out_path: str,
+) -> bool:
+    """
+    Plot pairwise within-set Tanimoto distribution.
+    Skipped (returns False) if fewer than 2 molecules (Assumption A2).
+    """
+    if len(smiles_list) < 2:
+        print(
+            f"    ⚠️  '{title}': only {len(smiles_list)} molecule(s) — "
+            "need ≥ 2 for pairwise histogram. Skipped."
+        )
+        return False
+    scores = pairwise_tanimoto(smiles_list)
+    return _save_histogram(
+        scores=scores,
+        xlabel="Pairwise Tanimoto Similarity",
+        title=title,
+        out_path=out_path,
+        color="#1f77b4",
+        n_total_mols=len(smiles_list),
+    )
+
+
+def plot_vs_original_histogram(
+    smiles_list: List[str],
+    original_smiles: Optional[str],
+    title: str,
+    out_path: str,
+) -> bool:
+    """
+    Plot each-molecule-vs-original Tanimoto distribution.
+    Skipped if original_smiles is None (Assumption A4).
+    """
+    if not original_smiles:
+        print(f"    ⚠️  '{title}': no original SMILES available. vs-original histogram skipped.")
+        return False
+    if not smiles_list:
+        print(f"    ⚠️  '{title}': empty pool. vs-original histogram skipped.")
+        return False
+    scores = vs_original_tanimoto(smiles_list, original_smiles)
+    return _save_histogram(
+        scores=scores,
+        xlabel="Tanimoto Similarity to Original Ligand",
+        title=title,
+        out_path=out_path,
+        color="#ff7f0e",
+        n_total_mols=len(smiles_list),
+    )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  PER-GROUP ANALYSIS  (one grid + two histograms)
+# ════════════════════════════════════════════════════════════════════════════
+
+def run_analysis_for_group(
+    smiles_pool: List[str],
+    original_smiles: Optional[str],
+    label: str,
+    out_dir: str,
+) -> Dict[str, bool]:
+    """
+    Produce grid + pairwise histogram + vs-original histogram for one group.
+
+    Parameters
+    ----------
+    smiles_pool     : deduplicated (or not) list of SMILES for this group
+    original_smiles : original unmasked ligand SMILES (may be None)
+    label           : human-readable label used in plot titles
+    out_dir         : directory where the three files are saved
+
+    Returns
+    -------
+    dict with keys "grid", "pairwise", "vs_original" → True/False
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    n = len(smiles_pool)
+    print(f"  Group: {label}  |  pool size: {n}")
+
+    grid_ok = draw_molecule_grid(
+        smiles_list = smiles_pool,
+        title       = label,
+        out_path    = os.path.join(out_dir, "molecule_grid.png"),
+    )
+
+    pw_ok = plot_pairwise_histogram(
+        smiles_list = smiles_pool,
+        title       = f"Pairwise Tanimoto — {label}",
+        out_path    = os.path.join(out_dir, "histogram_pairwise.png"),
+    )
+
+    vo_ok = plot_vs_original_histogram(
+        smiles_list     = smiles_pool,
+        original_smiles = original_smiles,
+        title           = f"vs Original Ligand — {label}",
+        out_path        = os.path.join(out_dir, "histogram_vs_original.png"),
+    )
+
+    return {"grid": grid_ok, "pairwise": pw_ok, "vs_original": vo_ok}
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  SAFE FILENAME HELPER
+# ════════════════════════════════════════════════════════════════════════════
+
+def _safe(s: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in s)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  MAIN ANALYSIS FUNCTION
+# ════════════════════════════════════════════════════════════════════════════
+
+def run_stage3(
+    pred_dir:       Optional[str] = None,
+    mask_calc_dir:  Optional[str] = None,
+    stage3_dir:     Optional[str] = None,
+    per_mask_count: bool = True,
+    deduplicate:    bool = True,
+) -> Dict[str, dict]:
+    """
+    Run Stage-3 analysis.
+
+    Parameters
+    ----------
+    pred_dir       : Stage-2 predictions folder  (default: config.PRED_DIR)
+    mask_calc_dir  : Stage-1 JSON folder          (default: config.MASK_CALC_OUTDIR)
+    stage3_dir     : output root for this stage   (default: config.STAGE3_DIR)
+    per_mask_count : also produce per-step outputs
+    deduplicate    : deduplicate pooled IA + random SMILES
+
+    Returns
+    -------
+    Dict keyed by ligand_id → analysis summary dict
+    """
+    pred_dir      = pred_dir      or config.PRED_DIR
+    mask_calc_dir = mask_calc_dir or config.MASK_CALC_OUTDIR
+    stage3_dir    = stage3_dir    or config.STAGE3_DIR
+
+    os.makedirs(stage3_dir, exist_ok=True)
+
+    # ── Load original SMILES from Stage-1 JSONs ───────────────────────────────
+    original_smiles_map = load_stage1_smiles(mask_calc_dir)
+    print(f"  Stage-1 original SMILES loaded: {len(original_smiles_map)} ligand(s)")
+
+    # ── Discover ligand sub-folders in PRED_DIR ───────────────────────────────
+    lig_dirs = sorted([
+        d for d in glob.glob(os.path.join(pred_dir, "*"))
+        if os.path.isdir(d)
+    ])
+
+    if not lig_dirs:
+        print(f"  ❌ No ligand sub-folders found in {pred_dir}")
+        print("     Run stage2_molecule_generation.py first.")
+        return {}
+
+    print(f"  Ligand folders found: {len(lig_dirs)}")
+
+    all_results: Dict[str, dict] = {}
+
+    for lig_dir in lig_dirs:
+        lig_id = os.path.basename(lig_dir)
+        orig   = original_smiles_map.get(lig_id)
+        if orig is None:
+            print(f"\n  ⚠️  {lig_id}: no Stage-1 SMILES found — vs-original histograms will be skipped.")
+
+        print(f"\n{'='*60}")
+        print(f"Ligand: {lig_id}")
+        print(f"{'='*60}")
+
+        # Load all predictions for this ligand
+        predictions = load_ligand_predictions(lig_dir)
+        if not predictions:
+            print(f"  ⚠️  No prediction txt files found. Skipping.")
+            continue
+
+        mask_counts = sorted(predictions.keys())
+        lig_out_dir = os.path.join(stage3_dir, _safe(lig_id))
+
+        # ── Aggregated: pool all mask counts together ─────────────────────────
+        all_ia   = [smi for mc in mask_counts for smi in predictions[mc]["ia"]]
+        all_rand = [smi for mc in mask_counts for smi in predictions[mc]["rand"]]
+        agg_pool = pool_smiles(all_ia, all_rand, deduplicate)
+
+        agg_result = run_analysis_for_group(
+            smiles_pool     = agg_pool,
+            original_smiles = orig,
+            label           = f"{lig_id} — aggregated (all masks, N={len(mask_counts)})",
+            out_dir         = os.path.join(lig_out_dir, "aggregated"),
+        )
+
+        per_mc_results: Dict[int, dict] = {}
+
+        # ── Per-mask-count ────────────────────────────────────────────────────
+        if per_mask_count:
+            for mc in mask_counts:
+                pool = pool_smiles(
+                    predictions[mc]["ia"],
+                    predictions[mc]["rand"],
+                    deduplicate,
+                )
+                mc_result = run_analysis_for_group(
+                    smiles_pool     = pool,
+                    original_smiles = orig,
+                    label           = f"{lig_id} — mask_count={mc}",
+                    out_dir         = os.path.join(lig_out_dir, f"mask_{mc:03d}"),
+                )
+                per_mc_results[mc] = mc_result
+
+        all_results[lig_id] = {
+            "aggregated":    agg_result,
+            "per_mask_count": per_mc_results,
+            "n_mask_counts": len(mask_counts),
+            "agg_pool_size": len(agg_pool),
+        }
+
+    return all_results
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  SELF-CONTAINED TEST
+# ════════════════════════════════════════════════════════════════════════════
+
+# Realistic SMILES pools to test with (diverse drug-like molecules)
+_TEST_IA_SMILES = [
+    "CC(=O)Oc1ccccc1C(=O)O",          # aspirin
+    "CC(C)Cc1ccc(cc1)C(C)C(=O)O",     # ibuprofen
+    "CC(=O)Nc1ccc(O)cc1",             # paracetamol
+    "OC(=O)c1ccccc1O",                # salicylic acid
+]
+_TEST_RAND_SMILES = [
+    "CN1C=NC2=C1C(=O)N(C(=O)N2C)C",  # caffeine
+    "CC(=O)Oc1ccccc1C(=O)O",          # aspirin (duplicate — tests deduplication)
+    "c1ccc2ccccc2c1",                  # naphthalene
+]
+_TEST_ORIGINAL_SMILES = "CC(=O)Oc1ccccc1C(=O)O"  # aspirin as "original"
+
+
+def _run_test() -> bool:
+    import shutil
+
+    print("\n" + "=" * 60)
+    print("STAGE 3 SELF-TEST")
+    print("=" * 60)
+
+    # ── Wipe and recreate config.STAGE3_DIR/test/ (Option A) ─────────────────
+    td = os.path.join(config.STAGE3_DIR, "test")
+    if os.path.exists(td):
+        shutil.rmtree(td)
+        print(f"  🗑  Wiped existing test dir: {td}")
+    os.makedirs(td)
+    print(f"  📁 Created fresh test dir:  {td}\n")
+
+    pred_dir      = os.path.join(td, "preds")
+    mask_calc_dir = os.path.join(td, "stage1")
+    stage3_dir    = os.path.join(td, "stage3_a")   # per_mask_count=True run
+    stage3_dir_b  = os.path.join(td, "stage3_b")   # per_mask_count=False run
+
+    passed = 0
+    failed = 0
+
+    def check(condition: bool, msg: str):
+        nonlocal passed, failed
+        if condition:
+            print(f"  ✅ PASS  {msg}")
+            passed += 1
+        else:
+            print(f"  ❌ FAIL  {msg}")
+            failed += 1
+
+    # ── Write synthetic Stage-2 txt files ────────────────────────────────────
+    lig_id  = "ASP-A-1"
+    lig_dir = os.path.join(pred_dir, _safe(lig_id))
+    os.makedirs(lig_dir)
+
+    for mc in range(1, 4):        # 3 mask steps
+        with open(os.path.join(lig_dir, f"ia_mask{mc:03d}.txt"), "w") as f:
+            f.write("\n".join(_TEST_IA_SMILES) + "\n")
+        with open(os.path.join(lig_dir, f"rand_mask{mc:03d}.txt"), "w") as f:
+            f.write("\n".join(_TEST_RAND_SMILES) + "\n")
+
+    # ── Write synthetic Stage-1 JSON ──────────────────────────────────────────
+    os.makedirs(mask_calc_dir)
+    s1_meta = {
+        "smiles": _TEST_ORIGINAL_SMILES,
+        "ligand": {"resname": "ASP", "chain": "A", "resseq": 1},
+        "masked_atom_indices": [0, 3],
+    }
+    with open(os.path.join(mask_calc_dir, "ASP-A-1.meta.json"), "w") as f:
+        json.dump(s1_meta, f)
+
+    # ── Run A: per_mask_count=True, deduplicate=True ──────────────────────────
+    results = run_stage3(
+        pred_dir       = pred_dir,
+        mask_calc_dir  = mask_calc_dir,
+        stage3_dir     = stage3_dir,
+        per_mask_count = True,
+        deduplicate    = True,
+    )
+
+    check(lig_id in results, f"'{lig_id}' present in results")
+
+    if lig_id in results:
+        r   = results[lig_id]
+        agg = r["aggregated"]
+
+        check(r["n_mask_counts"] == 3,
+              "n_mask_counts == 3")
+        check(agg["grid"],
+              "aggregated grid produced")
+        check(agg["pairwise"],
+              "aggregated pairwise histogram produced")
+        check(agg["vs_original"],
+              "aggregated vs-original histogram produced")
+
+        # Check files exist on disk
+        agg_dir = os.path.join(stage3_dir, _safe(lig_id), "aggregated")
+        check(os.path.exists(os.path.join(agg_dir, "molecule_grid.png")),
+              "molecule_grid.png on disk")
+        check(os.path.exists(os.path.join(agg_dir, "histogram_pairwise.png")),
+              "histogram_pairwise.png on disk")
+        check(os.path.exists(os.path.join(agg_dir, "histogram_vs_original.png")),
+              "histogram_vs_original.png on disk")
+
+        # Check per-mask-count outputs
+        for mc in range(1, 4):
+            mc_dir = os.path.join(stage3_dir, _safe(lig_id), f"mask_{mc:03d}")
+            check(os.path.exists(os.path.join(mc_dir, "molecule_grid.png")),
+                  f"mask_{mc:03d}/molecule_grid.png on disk")
+
+        # Deduplication: aspirin appears in both IA and RAND lists →
+        # deduplicated pool should be smaller than raw concatenation
+        agg_pool_size = r["agg_pool_size"]
+        raw_size      = 3 * (len(_TEST_IA_SMILES) + len(_TEST_RAND_SMILES))
+        check(agg_pool_size < raw_size,
+              f"deduplication reduced pool: {agg_pool_size} < {raw_size} (raw)")
+
+    # ── Run B: per_mask_count=False ───────────────────────────────────────────
+    run_stage3(
+        pred_dir       = pred_dir,
+        mask_calc_dir  = mask_calc_dir,
+        stage3_dir     = stage3_dir_b,
+        per_mask_count = False,
+        deduplicate    = True,
+    )
+    mc_dir_b = os.path.join(stage3_dir_b, _safe(lig_id), "mask_001")
+    check(not os.path.exists(mc_dir_b),
+          "per-mask-count dir absent when per_mask_count=False")
+
+    print(f"\n{'='*60}")
+    print(f"Test complete:  {passed} passed,  {failed} failed.")
+    print("✅ All tests passed." if failed == 0 else "❌ Some tests failed.")
+    print(f"\n  Test outputs preserved at: {td}")
+    return failed == 0
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ════════════════════════════════════════════════════════════════════════════
+
+def main():
+    print("\n" + "=" * 60)
+    print("STAGE 3: CHEMICAL SIMILARITY ANALYSIS")
+    print("=" * 60)
+
+    print("""
+  Before running the full analysis (which reads all Stage-2 prediction
+  files and Stage-1 JSONs), you can run a smoke test instead.
+
+  The smoke test:
+    • Does NOT need any Stage-1 or Stage-2 output files.
+    • Creates synthetic predictions for one ligand (aspirin) with
+      hard-coded SMILES (aspirin, ibuprofen, paracetamol, caffeine).
+    • Runs the full grid + histogram analysis with per_mask_count=True
+      and deduplication=True, then re-runs with per_mask_count=False.
+    • Saves all outputs to:
+        {test_dir}
+      (this directory is wiped clean at the start of every test run).
+    • Prints PASS / FAIL for each assertion.
+""".format(test_dir=os.path.join(config.STAGE3_DIR, "test")))
+
+    run_test = _ask_yes_no_default("Run the smoke test?", default=False)
+
+    if run_test:
+        ok = _run_test()
+        sys.exit(0 if ok else 1)
+
+    per_mask_count, deduplicate = ask_runtime_options()
+
+    results = run_stage3(
+        per_mask_count = per_mask_count,
+        deduplicate    = deduplicate,
+    )
+
+    print("\n" + "=" * 60)
+    print("✅ Stage 3 complete.")
+    print(f"   Outputs saved to: {config.STAGE3_DIR}")
+    print(f"   Ligands analysed: {len(results)}")
+    for lig_id, r in sorted(results.items()):
+        agg = r["aggregated"]
+        print(
+            f"   • {lig_id}  pool={r['agg_pool_size']}  "
+            f"grid={'✓' if agg['grid'] else '✗'}  "
+            f"pairwise={'✓' if agg['pairwise'] else '✗'}  "
+            f"vs_orig={'✓' if agg['vs_original'] else '✗'}  "
+            f"mask_steps={r['n_mask_counts']}"
+        )
+
+
+if __name__ == "__main__":
+    main()
