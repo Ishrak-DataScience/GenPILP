@@ -25,6 +25,7 @@ PRED_DIR           = f"{_OUT}/predictions_txt/"           # Stage 2 raw SMILES t
 PLOT_DIR           = f"{_OUT}/plots/"                     # Stage 2 incremental PNGs
 TEST_DIR           = f"{_OUT}/test/"                      # Stage 2 --test (wiped each run)
 STAGE3_DIR         = f"{_OUT}/stage3_analysis/"           # Stage 3 grids + histograms
+STAGE4_DIR         = f"{_OUT}/stage4_br4_matching/"       # Stage 4 BR4 nearest-neighbour analysis
 
 # ── Stage 1 ligands ────────────────────────────────────────────────────────────
 PIPELINE_INPUTS = [
