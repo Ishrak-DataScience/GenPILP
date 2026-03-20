@@ -26,6 +26,14 @@ PLOT_DIR           = f"{_OUT}/plots/"                     # Stage 2 incremental 
 TEST_DIR           = f"{_OUT}/test/"                      # Stage 2 --test (wiped each run)
 STAGE3_DIR         = f"{_OUT}/stage3_analysis/"           # Stage 3 grids + histograms
 STAGE4_DIR         = f"{_OUT}/stage4_br4_matching/"       # Stage 4 BR4 nearest-neighbour analysis
+STAGE5_DIR         = f"{_OUT}/stage5_chembl_matching/"     # Stage 5 ChEMBL BRD4 nearest-neighbour analysis
+CHEMBL_CACHE_PATH  = f"{_OUT}/stage5_chembl_matching/chembl_brd4_cache.csv"  # cached ChEMBL fetch
+STAGE6_DIR         = f"{_OUT}/stage6_docking/"              # Stage 6 docking outputs
+
+# ── GNINA docking binary ───────────────────────────────────────────────────────
+# Stage 6 will auto-download if the binary is not found at this path.
+GNINA_BINARY       = "./gnina"
+GNINA_DOWNLOAD_URL = "https://github.com/gnina/gnina/releases/download/v1.0.3/gnina"
 
 # ── Stage 1 ligands ────────────────────────────────────────────────────────────
 PIPELINE_INPUTS = [
