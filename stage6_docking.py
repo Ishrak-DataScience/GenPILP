@@ -133,21 +133,62 @@ def _download_gnina(dest_path: str, url: str) -> None:
     print(f"  ✅ GNINA downloaded and made executable: {dest_path}")
 
 
+# Local execution path — FUSE-mounted filesystems (Google Drive in Colab)
+# do not support direct binary execution via execve().  We always copy the
+# binary to a local path before running it.
+_GNINA_LOCAL = "/content/gnina"
+
+
+def _make_executable(path: str) -> None:
+    """Set executable bits on a file (equivalent to chmod +x)."""
+    current = os.stat(path).st_mode
+    os.chmod(path, current | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
 def ensure_gnina(
     binary_path: str = config.GNINA_BINARY,
     download_url: str = config.GNINA_DOWNLOAD_URL,
 ) -> str:
     """
-    Return path to a usable GNINA binary.
-    Auto-downloads if not found at binary_path.
-    """
-    if os.path.isfile(binary_path) and os.access(binary_path, os.X_OK):
-        print(f"  ✅ GNINA found: {binary_path}")
-        return binary_path
+    Return the path to a locally executable GNINA binary.
 
-    print(f"  GNINA not found at '{binary_path}'. Auto-downloading ...")
-    _download_gnina(binary_path, download_url)
-    return binary_path
+    Strategy (handles the Colab/Drive FUSE PermissionError):
+      1. If config.GNINA_BINARY exists on Drive → copy to _GNINA_LOCAL
+         and execute from there.
+      2. If config.GNINA_BINARY is missing → download it to Drive first
+         (permanent storage), then copy to _GNINA_LOCAL for execution.
+
+    The Drive copy is the permanent store; _GNINA_LOCAL is the
+    session-local executable copy.  Both are kept in sync.
+    """
+    drive_path = binary_path   # permanent storage (may be on Drive/FUSE)
+    local_path = _GNINA_LOCAL  # session-local, always on a real filesystem
+
+    # ── Step 1: ensure Drive copy exists ─────────────────────────────────────
+    if not os.path.isfile(drive_path):
+        print(f"  GNINA not found at '{drive_path}'. Downloading to Drive ...")
+        _download_gnina(drive_path, download_url)
+    else:
+        print(f"  ✅ GNINA found on Drive: {drive_path}")
+
+    # ── Step 2: copy to local filesystem if needed ────────────────────────────
+    # Always copy when the local copy is missing or older than the Drive copy.
+    drive_mtime = os.path.getmtime(drive_path)
+    local_ok = (
+        os.path.isfile(local_path)
+        and os.path.getmtime(local_path) >= drive_mtime
+        and os.access(local_path, os.X_OK)
+    )
+
+    if not local_ok:
+        print(f"  📋 Copying GNINA to local path for execution: {local_path}")
+        shutil.copy2(drive_path, local_path)
+        _make_executable(local_path)
+        print(f"  ✅ GNINA ready at local path: {local_path}")
+    else:
+        print(f"  ✅ GNINA already cached locally: {local_path}")
+
+    return local_path
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -700,6 +741,7 @@ def run_stage6(
             continue
 
         n_docked = 0
+        n_cached = 0
         n_failed = 0
 
         for mol_idx, smiles in enumerate(pool, start=1):
@@ -713,45 +755,71 @@ def run_stage6(
 
             print(f"  [{mol_idx:>4d}/{len(pool)}] {smiles[:60]}", end=" ... ", flush=True)
 
-            # SMILES → SDF
-            if not smiles_to_sdf(smiles, lig_sdf, name=f"mol_{mol_idx:04d}"):
-                print("3D embedding failed. Skipped.")
-                n_failed += 1
-                continue
-
-            # Dock
-            ok = run_gnina(
-                gnina_bin = gnina_bin,
-                receptor  = rec_pdb,
-                ligand    = lig_sdf,
-                autobox   = orig_pdb,
-                out_sdf   = out_sdf,
-                log_file  = log_file,
-                n_poses   = 9,    # always generate 9; filter on write
-            )
-            if not ok:
-                print("Docking failed. Skipped.")
-                n_failed += 1
-                continue
-
-            # Parse scores
-            scores = parse_gnina_scores(out_sdf)
-            print(f"OK  ({len(scores)} poses)")
-
-            # Write complex PDB files (up to n_poses)
-            written = write_complexes_from_gnina_sdf(
-                receptor_pdb   = rec_pdb,
-                poses_sdf      = out_sdf,
-                out_prefix     = prefix,
-                ligand_resname = resname,
-                chain_id       = chain,
-                resseq         = resseq,
-                write_conect   = True,
-                unique_atom_names = True,
-                max_poses      = n_poses,
+            # ── Cache check: skip docking if a valid output SDF already exists ──
+            # A non-empty docked_poses.sdf means this molecule was already docked
+            # successfully in a previous run.  Re-parse its scores and reuse them
+            # without calling GNINA again.
+            already_docked = (
+                os.path.isfile(out_sdf)
+                and os.path.getsize(out_sdf) > 0
+                and len(parse_gnina_scores(out_sdf)) > 0
             )
 
-            # Append to summary CSV
+            if already_docked:
+                print("cached ✓", flush=True)
+                scores = parse_gnina_scores(out_sdf)
+                # Reconstruct the list of complex PDB paths that were written
+                # previously so the CSV column stays accurate.
+                written = sorted(
+                    f for f in [
+                        f"{prefix}_pose{p:03d}.pdb"
+                        for p in range(1, len(scores) + 1)
+                    ]
+                    if os.path.isfile(f)
+                )
+                n_cached += 1
+
+            else:
+                # ── SMILES → SDF ──────────────────────────────────────────────
+                if not smiles_to_sdf(smiles, lig_sdf, name=f"mol_{mol_idx:04d}"):
+                    print("3D embedding failed. Skipped.")
+                    n_failed += 1
+                    continue
+
+                # ── Dock ──────────────────────────────────────────────────────
+                ok = run_gnina(
+                    gnina_bin = gnina_bin,
+                    receptor  = rec_pdb,
+                    ligand    = lig_sdf,
+                    autobox   = orig_pdb,
+                    out_sdf   = out_sdf,
+                    log_file  = log_file,
+                    n_poses   = 9,    # always generate 9; filter on write
+                )
+                if not ok:
+                    print("Docking failed. Skipped.")
+                    n_failed += 1
+                    continue
+
+                # ── Parse scores ──────────────────────────────────────────────
+                scores = parse_gnina_scores(out_sdf)
+                print(f"OK  ({len(scores)} poses)")
+
+                # ── Write complex PDB files (up to n_poses) ───────────────────
+                written = write_complexes_from_gnina_sdf(
+                    receptor_pdb   = rec_pdb,
+                    poses_sdf      = out_sdf,
+                    out_prefix     = prefix,
+                    ligand_resname = resname,
+                    chain_id       = chain,
+                    resseq         = resseq,
+                    write_conect   = True,
+                    unique_atom_names = True,
+                    max_poses      = n_poses,
+                )
+                n_docked += 1
+
+            # ── Append to summary CSV (both fresh and cached) ─────────────────
             for score_row in scores:
                 pose_num = score_row["pose"]
                 pdb_file = written[pose_num - 1] if pose_num <= len(written) else ""
@@ -766,15 +834,15 @@ def run_stage6(
                     "complex_pdb":        pdb_file,
                 })
 
-            n_docked += 1
-
         all_results[lig_id] = {
             "n_molecules": len(pool),
             "n_docked":    n_docked,
+            "n_cached":    n_cached,
             "n_failed":    n_failed,
             "csv_path":    csv_path,
         }
-        print(f"\n  {lig_id}: {n_docked} docked, {n_failed} failed.")
+        print(f"\n  {lig_id}: {n_docked} newly docked, "
+              f"{n_cached} from cache, {n_failed} failed.")
 
     # ── Write global summary CSV ──────────────────────────────────────────────
     if csv_rows:
