@@ -2,22 +2,30 @@
 """
 stage6_docking.py
 =================
-Stage 6 of the pipeline — molecular docking of generated molecules.
+Stage 6 of the pipeline — molecular docking + score visualisation.
 
 Uses GNINA (v1.0.3) with autobox to dock all generated molecules from
 Stage 2 into the BRD4 binding pocket defined by the original ligand
 in each PDB structure.
 
 Per ligand group (e.g. EAM-A-1), produces:
-  docked/<group>/<molecule_idx>/
-      ligand.sdf                    — 3D conformer input to GNINA
-      docked_poses.sdf              — GNINA multi-pose output
-      complex_pose001.pdb           — receptor + best pose (or all N poses)
-      complex_pose002.pdb           — (if n_poses > 1)
-      ...
+  <stage6_dir>/<group>/
+      rec.pdb                       — receptor (ATOM records only)
+      orig.pdb                      — autobox ligand (HETATM)
+      mol_0001/
+          ligand.sdf                — 3D conformer input to GNINA
+          docked_poses.sdf          — GNINA multi-pose output
+          complex_pose001.pdb       — receptor + docked ligand (up to n_poses)
+          docking.log
+      mol_0002/ ...
+
   docking_summary.csv               — one row per (group, molecule, pose)
       columns: ligand_group, mol_idx, smiles, pose, CNNscore,
                CNNaffinity, minimizedAffinity, complex_pdb
+
+After docking, two visualisation PNGs are saved to STAGE6_DIR:
+  stage6_docking_top10_molecules_all_scores_BARCHART.png
+  stage6_docking_all_molecules_all_scores_BARCHART.png
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ASSUMPTIONS
@@ -26,34 +34,33 @@ A1.  GNINA is Linux-only (x86_64). The auto-download fetches the
      pre-compiled binary from GitHub. This works in Colab and on any
      Linux machine. macOS / Windows require WSL or manual compilation.
 
-A2.  GNINA binary location is config.GNINA_BINARY (default "./gnina").
-     If not found, Stage 6 auto-downloads it (Ambiguity 2 Option A).
+A2.  GNINA binary location is config.GNINA_BINARY.
+     If not found, Stage 6 auto-downloads it.
      The download URL is config.GNINA_DOWNLOAD_URL.
+     Google Drive (Colab FUSE) cannot execute binaries; the binary is
+     copied to /content/gnina before every run.
 
 A3.  Receptor preparation: ATOM records from the PDB are written to
-     rec.pdb (matching the notebook Cell 9). HETATM records matching
-     resname + chain + resseq are written to orig.pdb (autobox ligand).
+     rec.pdb. HETATM records matching resname + chain + resseq are
+     written to orig.pdb (autobox ligand).
 
-A4.  SMILES → 3D SDF conversion uses RDKit ETKDG + UFF minimisation
-     (identical to notebook Cell 7). If 3D embedding fails for a
-     molecule it is skipped with a warning.
+A4.  SMILES → 3D SDF conversion uses RDKit ETKDGv3 + UFF minimisation.
+     If 3D embedding fails the molecule is skipped with a warning.
 
-A5.  The PDB file path and ligand identity (resname, chain, resseq) for
-     each group are read from Stage-1 .meta.json files in
-     config.MASK_CALC_OUTDIR, matched by the ligand key
-     "{resname}-{chain}-{resseq}".
+A5.  The PDB file path and ligand identity for each group are read from
+     Stage-1 .meta.json files in config.MASK_CALC_OUTDIR, matched by
+     the key "{resname}-{chain}-{resseq}".
 
-A6.  All generated molecules are docked (Ambiguity 1 Option A).
+A6.  All generated molecules are docked (no pre-filter).
 
-A7.  Number of poses to keep is asked at runtime (default 1).
-     GNINA always generates up to 9 internally; this setting controls
-     how many complex PDB files are written. Score CSV always contains
-     all GNINA poses regardless of this setting.
+A7.  Number of poses to keep as complex PDB files is asked at runtime
+     (default 1). GNINA always generates up to 9 internally; the CSV
+     always contains all GNINA poses regardless of this setting.
 
 A8.  Score properties read from GNINA's output SDF:
-       CNNscore       — CNN-predicted binding probability  (higher = better)
-       CNNaffinity    — CNN-predicted -log Kd/Ki            (higher = better)
-       minimizedAffinity — Vinardo score (kcal/mol)          (more negative = better)
+       CNNscore          — CNN-predicted binding probability  (higher = better)
+       CNNaffinity       — CNN-predicted −log Kd/Ki           (higher = better)
+       minimizedAffinity — Vinardo score (kcal/mol)           (more negative = better)
      If a property is absent in a pose, it is written as "" in the CSV.
 
 A9.  The complex PDB writing code is transcribed verbatim from the
@@ -63,37 +70,54 @@ A10. The self-test creates a mock GNINA shell script that copies a
      pre-built minimal SDF to the expected output path so no real
      binary or GPU is required.
 
+A11. already_docked cache: a molecule is considered already docked if
+     its docked_poses.sdf exists, is non-empty, AND RDKit can parse at
+     least one pose from it. Cached molecules are added to the CSV but
+     GNINA is not called again. n_cached is tracked and reported.
+
+A12. Visualisation ranking: CNNaffinity is the primary sort key
+     (higher = better); minimizedAffinity is the tiebreaker
+     (lower = better). Only pose 1 per molecule is used for ranking.
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 HOW TO RUN  (Colab)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  # Step 1 — run after stage2_molecule_generation.py
-  # GNINA is downloaded automatically on first run (~500 MB)
   python stage6_docking.py
+  GNINA is downloaded automatically on first run (~500 MB).
 
 HOW TO RUN  (local Linux)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  # Optionally pre-download GNINA and set config.GNINA_BINARY to its path:
-  #   wget https://github.com/gnina/gnina/releases/download/v1.0.3/gnina
-  #   chmod +x gnina
+  wget https://github.com/gnina/gnina/releases/download/v1.0.3/gnina
+  chmod +x gnina   # then set config.GNINA_BINARY to its absolute path
   python stage6_docking.py
 
 HOW TO TEST  (no GNINA, no GPU required)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Answer "yes" to the smoke-test prompt.
+  Answer "yes" to the smoke-test prompt when running the file.
   Writes to config.STAGE6_DIR/test/ (wiped each run).
 """
 
 import csv
 import glob
+import json
 import os
 import shutil
 import stat
 import subprocess
 import sys
+import textwrap
 import urllib.request
+import warnings
 from collections import defaultdict
 from typing import Dict, Iterable, List, Optional, Tuple
 
+import matplotlib
+matplotlib.use("Agg")   # non-interactive — safe in Colab and headless
+import matplotlib.gridspec as gridspec
+import matplotlib.patches as mpatches
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+import numpy as np
 import pandas as pd
 from rdkit import Chem
 from rdkit.Chem import AllChem
@@ -108,9 +132,7 @@ from stage4_br4_matching import _safe, load_pool_for_ligand
 
 def _download_gnina(dest_path: str, url: str) -> None:
     """Download the GNINA binary to dest_path and make it executable."""
-    # Guard: a previous failed run may have left a directory at dest_path
-    # (e.g. if os.makedirs was mistakenly called with dest_path itself).
-    # Remove it so urlretrieve can create a file at that path.
+    # Guard: a previous failed run may have left a directory at dest_path.
     if os.path.isdir(dest_path):
         print(f"  ⚠️  Found a directory at '{dest_path}' — removing it "
                "(left by a previous failed download attempt).")
@@ -127,20 +149,17 @@ def _download_gnina(dest_path: str, url: str) -> None:
                 print(f"    {pct:.0f}% ...", flush=True)
 
     urllib.request.urlretrieve(url, dest_path, reporthook=_progress)
-    # Make executable (equivalent to chmod +x)
     current = os.stat(dest_path).st_mode
     os.chmod(dest_path, current | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     print(f"  ✅ GNINA downloaded and made executable: {dest_path}")
 
 
-# Local execution path — FUSE-mounted filesystems (Google Drive in Colab)
-# do not support direct binary execution via execve().  We always copy the
-# binary to a local path before running it.
+# Local execution path: Google Drive (Colab FUSE) cannot execute binaries.
+# We always copy the Drive binary here before running it.
 _GNINA_LOCAL = "/content/gnina"
 
 
 def _make_executable(path: str) -> None:
-    """Set executable bits on a file (equivalent to chmod +x)."""
     current = os.stat(path).st_mode
     os.chmod(path, current | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
@@ -152,34 +171,28 @@ def ensure_gnina(
     """
     Return the path to a locally executable GNINA binary.
 
-    Strategy (handles the Colab/Drive FUSE PermissionError):
-      1. If config.GNINA_BINARY exists on Drive → copy to _GNINA_LOCAL
-         and execute from there.
-      2. If config.GNINA_BINARY is missing → download it to Drive first
-         (permanent storage), then copy to _GNINA_LOCAL for execution.
+    1. If config.GNINA_BINARY exists on Drive → copy to _GNINA_LOCAL.
+    2. If missing → download to Drive first, then copy to _GNINA_LOCAL.
 
     The Drive copy is the permanent store; _GNINA_LOCAL is the
-    session-local executable copy.  Both are kept in sync.
+    session-local executable (required because Drive is FUSE-mounted
+    in Colab and the kernel cannot execve() FUSE-backed paths).
     """
-    drive_path = binary_path   # permanent storage (may be on Drive/FUSE)
-    local_path = _GNINA_LOCAL  # session-local, always on a real filesystem
+    drive_path = binary_path
+    local_path = _GNINA_LOCAL
 
-    # ── Step 1: ensure Drive copy exists ─────────────────────────────────────
     if not os.path.isfile(drive_path):
         print(f"  GNINA not found at '{drive_path}'. Downloading to Drive ...")
         _download_gnina(drive_path, download_url)
     else:
         print(f"  ✅ GNINA found on Drive: {drive_path}")
 
-    # ── Step 2: copy to local filesystem if needed ────────────────────────────
-    # Always copy when the local copy is missing or older than the Drive copy.
     drive_mtime = os.path.getmtime(drive_path)
     local_ok = (
         os.path.isfile(local_path)
         and os.path.getmtime(local_path) >= drive_mtime
         and os.access(local_path, os.X_OK)
     )
-
     if not local_ok:
         print(f"  📋 Copying GNINA to local path for execution: {local_path}")
         shutil.copy2(drive_path, local_path)
@@ -209,7 +222,6 @@ def _ask_yes_no_default(question: str, default: bool) -> bool:
 
 
 def _ask_n_poses() -> int:
-    """Ask how many GNINA poses to write as complex PDB files. Default 1."""
     print("""
   Number of docking poses to write as complex PDB files.
     GNINA generates up to 9 poses internally; this controls how many
@@ -249,24 +261,19 @@ def ask_runtime_options() -> int:
 
 def smiles_to_sdf(smiles: str, out_path: str, name: str = "Ligand") -> bool:
     """
-    Convert SMILES to a 3D SDF file using RDKit ETKDG + UFF.
-    Returns True on success, False if 3D embedding fails (Assumption A4).
-    Transcribed from notebook Cell 7.
+    Convert SMILES to a 3D SDF using RDKit ETKDGv3 + UFF.
+    Returns True on success, False if embedding fails (Assumption A4).
     """
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         print(f"    ⚠️  Cannot parse SMILES: {smiles[:60]}")
         return False
-
     mol = Chem.AddHs(mol)
-    result = AllChem.EmbedMolecule(mol, AllChem.ETKDGv3())
-    if result == -1:
+    if AllChem.EmbedMolecule(mol, AllChem.ETKDGv3()) == -1:
         print(f"    ⚠️  3D embedding failed for: {smiles[:60]}")
         return False
-
     AllChem.UFFOptimizeMolecule(mol)
     mol.SetProp("_Name", name)
-
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     w = Chem.SDWriter(out_path)
     w.write(mol)
@@ -275,17 +282,10 @@ def smiles_to_sdf(smiles: str, out_path: str, name: str = "Ligand") -> bool:
 
 
 def prepare_receptor(pdb_path: str, rec_out: str) -> bool:
-    """
-    Write ATOM records only from pdb_path to rec_out (receptor without ligand).
-    Mirrors notebook Cell 9: grep ATOM $Protein_File > rec.pdb
-    Returns True if any ATOM lines were written.
-    """
+    """Write ATOM records from pdb_path to rec_out (receptor only)."""
     os.makedirs(os.path.dirname(rec_out) or ".", exist_ok=True)
-    lines = []
-    with open(pdb_path) as f:
-        for line in f:
-            if line.startswith("ATOM  ") or line.startswith("ATOM "):
-                lines.append(line)
+    lines = [ln for ln in open(pdb_path)
+             if ln.startswith("ATOM  ") or ln.startswith("ATOM ")]
     if not lines:
         print(f"    ⚠️  No ATOM records found in {pdb_path}")
         return False
@@ -296,37 +296,28 @@ def prepare_receptor(pdb_path: str, rec_out: str) -> bool:
 
 
 def prepare_autobox_ligand(
-    pdb_path: str,
-    orig_out: str,
-    resname: str,
-    chain: str,
-    resseq: int,
+    pdb_path: str, orig_out: str,
+    resname: str, chain: str, resseq: int,
 ) -> bool:
-    """
-    Write HETATM records matching resname + chain + resseq to orig_out.
-    This defines the autobox for GNINA docking.
-    Mirrors notebook Cell 9: grep HETATM $Protein_File | grep "$lig_grep" > orig.pdb
-    Returns True if any matching lines were written.
-    """
+    """Write HETATM records for the autobox reference ligand."""
     os.makedirs(os.path.dirname(orig_out) or ".", exist_ok=True)
     lines = []
     with open(pdb_path) as f:
         for line in f:
             if not line.startswith("HETATM"):
                 continue
-            line_res   = line[17:20].strip()
-            line_chain = line[21].strip()
+            if line[17:20].strip() != resname:
+                continue
+            if line[21].strip() != chain:
+                continue
             try:
-                line_seq = int(line[22:26])
+                if int(line[22:26]) != resseq:
+                    continue
             except ValueError:
                 continue
-            if (line_res == resname
-                    and line_chain == chain
-                    and line_seq == resseq):
-                lines.append(line)
+            lines.append(line)
     if not lines:
-        print(f"    ⚠️  No HETATM records found for "
-              f"{resname}:{chain}:{resseq} in {pdb_path}")
+        print(f"    ⚠️  No HETATM records for {resname}:{chain}:{resseq} in {pdb_path}")
         return False
     with open(orig_out, "w") as f:
         f.writelines(lines)
@@ -339,27 +330,17 @@ def prepare_autobox_ligand(
 # ════════════════════════════════════════════════════════════════════════════
 
 def run_gnina(
-    gnina_bin: str,
-    receptor:  str,
-    ligand:    str,
-    autobox:   str,
-    out_sdf:   str,
-    log_file:  str,
-    n_poses:   int = 9,
+    gnina_bin: str, receptor: str, ligand: str,
+    autobox: str, out_sdf: str, log_file: str,
+    n_poses: int = 9,
 ) -> bool:
-    """
-    Run GNINA docking via subprocess.
-    Returns True on success (exit code 0).
-    Mirrors notebook Cell 10.
-    """
+    """Run GNINA docking via subprocess. Returns True on success."""
     os.makedirs(os.path.dirname(out_sdf) or ".", exist_ok=True)
     cmd = [
         gnina_bin,
-        "-r", receptor,
-        "-l", ligand,
+        "-r", receptor, "-l", ligand,
         "--autobox_ligand", autobox,
-        "--out",  out_sdf,
-        "--log",  log_file,
+        "--out", out_sdf, "--log", log_file,
         "--num_modes", str(n_poses),
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -377,20 +358,15 @@ def run_gnina(
 _SCORE_PROPS = ("CNNscore", "CNNaffinity", "minimizedAffinity")
 
 
-def parse_gnina_scores(
-    sdf_path: str,
-) -> List[Dict[str, str]]:
+def parse_gnina_scores(sdf_path: str) -> List[Dict[str, str]]:
     """
-    Read GNINA output SDF and extract per-pose scores (Assumption A8).
-    Returns list of dicts, one per pose, keys: pose, CNNscore,
-    CNNaffinity, minimizedAffinity.
+    Read GNINA output SDF and extract per-pose scores.
+    Returns list of dicts, one per pose.
     """
     if not os.path.exists(sdf_path):
         return []
-    rows = []
-    suppl = Chem.ForwardSDMolSupplier(sdf_path, removeHs=False, sanitize=False)
-    pose = 0
-    for mol in suppl:
+    rows, pose = [], 0
+    for mol in Chem.ForwardSDMolSupplier(sdf_path, removeHs=False, sanitize=False):
         if mol is None:
             continue
         pose += 1
@@ -402,7 +378,7 @@ def parse_gnina_scores(
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  COMPLEX WRITING — verbatim from notebook Cell 12 (Assumption A9)
+#  COMPLEX WRITING — transcribed verbatim from notebook Cell 12 (Assumption A9)
 # ════════════════════════════════════════════════════════════════════════════
 
 _TWO_LETTER = {
@@ -422,9 +398,7 @@ def _ensure_nl80(line: str) -> str:
     return line
 
 
-def _split_before_terminal(
-    records: List[str],
-) -> Tuple[List[str], List[str]]:
+def _split_before_terminal(records: List[str]) -> Tuple[List[str], List[str]]:
     terminal = {"END", "ENDMDL", "MASTER"}
     i = len(records)
     while i > 0:
@@ -457,10 +431,7 @@ def _infer_element_from_name(name: str) -> str:
 def _format_atom_name(name: str, elem: str) -> str:
     e = (elem or "").strip().upper()
     n = (name or e).strip()
-    if len(e) == 1:
-        return f"{n:>4}"[:4]
-    else:
-        return f"{n:<4}"[:4]
+    return f"{n:>4}"[:4] if len(e) == 1 else f"{n:<4}"[:4]
 
 
 def _format_hetatm(
@@ -470,9 +441,7 @@ def _format_hetatm(
     occ: float = 1.00, bfac: float = 0.00,
     alt: str = " ", icode: str = " ",
 ) -> str:
-    e = (elem or "").strip().upper()
-    if not e:
-        e = _infer_element_from_name(atom_name)
+    e = (elem or "").strip().upper() or _infer_element_from_name(atom_name)
     aname = _format_atom_name(atom_name, e)
     res   = f"{(resname or 'LIG').upper():>3}"[:3]
     ch    = (chain or " ")[:1]
@@ -504,11 +473,8 @@ def _load_poses_robust(sdf_path: str) -> Iterable[Chem.Mol]:
             DetermineConnectivity(m)
             total_charge = sum(a.GetFormalCharge() for a in m.GetAtoms())
             DetermineBondOrders(
-                m,
-                charge=total_charge,
-                allowChargedFragments=True,
-                embedChiral=True,
-                useAtomMap=False,
+                m, charge=total_charge,
+                allowChargedFragments=True, embedChiral=True, useAtomMap=False,
             )
             Chem.SanitizeMol(m)
             yield m
@@ -517,27 +483,19 @@ def _load_poses_robust(sdf_path: str) -> Iterable[Chem.Mol]:
 
 
 def write_complexes_from_gnina_sdf(
-    receptor_pdb:     str,
-    poses_sdf:        str,
-    out_prefix:       str,
-    ligand_resname:   str = "LIG",
-    chain_id:         str = "A",
-    resseq:           int = 1,
-    write_conect:     bool = True,
-    unique_atom_names: bool = True,
-    max_poses:        int = 9,
+    receptor_pdb: str, poses_sdf: str, out_prefix: str,
+    ligand_resname: str = "LIG", chain_id: str = "A", resseq: int = 1,
+    write_conect: bool = True, unique_atom_names: bool = True,
+    max_poses: int = 9,
 ) -> List[str]:
     """
     Create one complex PDB per pose: receptor + ligand HETATM (+ CONECT).
-    Returns list of written file paths.
     max_poses caps the number of complex PDBs written (Assumption A7).
-    Transcribed verbatim from notebook Cell 12 (Assumption A9).
     """
     with open(receptor_pdb) as fh:
         rec_all = fh.readlines()
     rec_prefix, rec_terminal = _split_before_terminal(rec_all)
     base_serial = _last_serial(rec_prefix)
-
     os.makedirs(os.path.dirname(out_prefix) or ".", exist_ok=True)
 
     written:  List[str] = []
@@ -552,9 +510,8 @@ def write_complexes_from_gnina_sdf(
 
         conf   = mol.GetConformer()
         serial = base_serial
-        het_lines: List[str] = []
+        het_lines:  List[str] = []
         idx2serial: Dict[int, int] = {}
-
         elem_counts: Dict[str, int] = defaultdict(int)
 
         def unique_name(sym: str) -> str:
@@ -596,9 +553,7 @@ def write_complexes_from_gnina_sdf(
         out_path = f"{out_prefix}_pose{pose_idx:03d}.pdb"
         with open(out_path, "w") as fh:
             fh.writelines(
-                rec_prefix
-                + het_lines
-                + conect_lines
+                rec_prefix + het_lines + conect_lines
                 + (rec_terminal if rec_terminal else ["END\n"])
             )
         written.append(out_path)
@@ -611,12 +566,7 @@ def write_complexes_from_gnina_sdf(
 # ════════════════════════════════════════════════════════════════════════════
 
 def load_stage1_metadata(mask_calc_dir: str) -> Dict[str, dict]:
-    """
-    Load Stage-1 .meta.json files.
-    Returns {ligand_key → meta_dict} where
-    ligand_key = "{resname}-{chain}-{resseq}".
-    """
-    import json
+    """Load Stage-1 .meta.json files. Returns {ligand_key → meta_dict}."""
     result: Dict[str, dict] = {}
     for path in sorted(glob.glob(os.path.join(mask_calc_dir, "*.json"))):
         try:
@@ -647,21 +597,13 @@ def run_stage6(
     """
     Run Stage-6 docking for all generated molecules.
 
-    Parameters
-    ----------
-    pred_dir      : Stage-2 predictions folder  (default: config.PRED_DIR)
-    mask_calc_dir : Stage-1 JSON folder          (default: config.MASK_CALC_OUTDIR)
-    stage6_dir    : output root                  (default: config.STAGE6_DIR)
-    gnina_bin     : GNINA binary path            (default: config.GNINA_BINARY)
-    n_poses       : complex PDB files to write per molecule
-    pool_choice   : 'ia', 'rand', or 'both'
-
     Returns
     -------
     Dict keyed by ligand_id:
         {
           "n_molecules" : int,
           "n_docked"    : int,
+          "n_cached"    : int,   ← molecules skipped because already docked
           "n_failed"    : int,
           "csv_path"    : str,
         }
@@ -673,14 +615,10 @@ def run_stage6(
 
     os.makedirs(stage6_dir, exist_ok=True)
 
-    # ── Ensure GNINA is available ─────────────────────────────────────────────
-    gnina_bin = ensure_gnina(gnina_bin, config.GNINA_DOWNLOAD_URL)
-
-    # ── Load Stage-1 metadata (PDB paths + ligand identities) ─────────────────
+    gnina_bin   = ensure_gnina(gnina_bin, config.GNINA_DOWNLOAD_URL)
     stage1_meta = load_stage1_metadata(mask_calc_dir)
     print(f"  Stage-1 metadata loaded: {len(stage1_meta)} ligand(s)")
 
-    # ── Discover ligand prediction folders ───────────────────────────────────
     lig_dirs = sorted([
         d for d in glob.glob(os.path.join(pred_dir, "*"))
         if os.path.isdir(d)
@@ -690,10 +628,8 @@ def run_stage6(
         return {}
     print(f"  Ligand folders found: {len(lig_dirs)}")
 
-    # ── Global summary CSV ────────────────────────────────────────────────────
     csv_path = os.path.join(stage6_dir, "docking_summary.csv")
     csv_rows: List[dict] = []
-
     all_results: Dict[str, dict] = {}
 
     for lig_dir in lig_dirs:
@@ -703,7 +639,6 @@ def run_stage6(
         print(f"Ligand: {lig_id}")
         print(f"{'='*60}")
 
-        # ── Match to Stage-1 metadata ─────────────────────────────────────────
         meta = stage1_meta.get(lig_id)
         if meta is None:
             print(f"  ⚠️  No Stage-1 metadata found for '{lig_id}'. Skipping.")
@@ -719,7 +654,6 @@ def run_stage6(
             print(f"  ⚠️  PDB file not found: {pdb_path}. Skipping.")
             continue
 
-        # ── Load generated molecules ──────────────────────────────────────────
         pool = load_pool_for_ligand(lig_dir, pool_choice)
         print(f"  Generated molecules to dock: {len(pool)}")
         if not pool:
@@ -729,7 +663,6 @@ def run_stage6(
         lig_out_dir = os.path.join(stage6_dir, _safe(lig_id))
         os.makedirs(lig_out_dir, exist_ok=True)
 
-        # ── Prepare receptor and autobox once per ligand group ─────────────────
         rec_pdb  = os.path.join(lig_out_dir, "rec.pdb")
         orig_pdb = os.path.join(lig_out_dir, "orig.pdb")
 
@@ -755,10 +688,9 @@ def run_stage6(
 
             print(f"  [{mol_idx:>4d}/{len(pool)}] {smiles[:60]}", end=" ... ", flush=True)
 
-            # ── Cache check: skip docking if a valid output SDF already exists ──
-            # A non-empty docked_poses.sdf means this molecule was already docked
-            # successfully in a previous run.  Re-parse its scores and reuse them
-            # without calling GNINA again.
+            # ── Cache check (Assumption A11) ──────────────────────────────────
+            # A molecule is already docked if its output SDF exists, is non-empty,
+            # and RDKit can parse at least one valid pose from it.
             already_docked = (
                 os.path.isfile(out_sdf)
                 and os.path.getsize(out_sdf) > 0
@@ -768,70 +700,60 @@ def run_stage6(
             if already_docked:
                 print("cached ✓", flush=True)
                 scores = parse_gnina_scores(out_sdf)
-                # Reconstruct the list of complex PDB paths that were written
-                # previously so the CSV column stays accurate.
+                # Reconstruct which complex PDB files exist from the previous run
                 written = sorted(
-                    f for f in [
-                        f"{prefix}_pose{p:03d}.pdb"
-                        for p in range(1, len(scores) + 1)
+                    p for p in [
+                        f"{prefix}_pose{pose_n:03d}.pdb"
+                        for pose_n in range(1, len(scores) + 1)
                     ]
-                    if os.path.isfile(f)
+                    if os.path.isfile(p)
                 )
                 n_cached += 1
 
             else:
-                # ── SMILES → SDF ──────────────────────────────────────────────
+                # SMILES → SDF
                 if not smiles_to_sdf(smiles, lig_sdf, name=f"mol_{mol_idx:04d}"):
                     print("3D embedding failed. Skipped.")
                     n_failed += 1
                     continue
 
-                # ── Dock ──────────────────────────────────────────────────────
+                # Dock
                 ok = run_gnina(
-                    gnina_bin = gnina_bin,
-                    receptor  = rec_pdb,
-                    ligand    = lig_sdf,
-                    autobox   = orig_pdb,
-                    out_sdf   = out_sdf,
-                    log_file  = log_file,
-                    n_poses   = 9,    # always generate 9; filter on write
+                    gnina_bin=gnina_bin, receptor=rec_pdb,
+                    ligand=lig_sdf, autobox=orig_pdb,
+                    out_sdf=out_sdf, log_file=log_file,
+                    n_poses=9,   # always generate 9; filter on write
                 )
                 if not ok:
                     print("Docking failed. Skipped.")
                     n_failed += 1
                     continue
 
-                # ── Parse scores ──────────────────────────────────────────────
                 scores = parse_gnina_scores(out_sdf)
                 print(f"OK  ({len(scores)} poses)")
 
-                # ── Write complex PDB files (up to n_poses) ───────────────────
                 written = write_complexes_from_gnina_sdf(
-                    receptor_pdb   = rec_pdb,
-                    poses_sdf      = out_sdf,
-                    out_prefix     = prefix,
-                    ligand_resname = resname,
-                    chain_id       = chain,
-                    resseq         = resseq,
-                    write_conect   = True,
-                    unique_atom_names = True,
-                    max_poses      = n_poses,
+                    receptor_pdb=rec_pdb, poses_sdf=out_sdf,
+                    out_prefix=prefix,
+                    ligand_resname=resname, chain_id=chain, resseq=resseq,
+                    write_conect=True, unique_atom_names=True,
+                    max_poses=n_poses,
                 )
                 n_docked += 1
 
-            # ── Append to summary CSV (both fresh and cached) ─────────────────
+            # ── Append to CSV (both fresh and cached) ─────────────────────────
             for score_row in scores:
                 pose_num = score_row["pose"]
                 pdb_file = written[pose_num - 1] if pose_num <= len(written) else ""
                 csv_rows.append({
-                    "ligand_group":       lig_id,
-                    "mol_idx":            mol_idx,
-                    "smiles":             smiles,
-                    "pose":               pose_num,
-                    "CNNscore":           score_row.get("CNNscore", ""),
-                    "CNNaffinity":        score_row.get("CNNaffinity", ""),
-                    "minimizedAffinity":  score_row.get("minimizedAffinity", ""),
-                    "complex_pdb":        pdb_file,
+                    "ligand_group":      lig_id,
+                    "mol_idx":           mol_idx,
+                    "smiles":            smiles,
+                    "pose":              pose_num,
+                    "CNNscore":          score_row.get("CNNscore", ""),
+                    "CNNaffinity":       score_row.get("CNNaffinity", ""),
+                    "minimizedAffinity": score_row.get("minimizedAffinity", ""),
+                    "complex_pdb":       pdb_file,
                 })
 
         all_results[lig_id] = {
@@ -857,10 +779,290 @@ def run_stage6(
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  VISUALISATION
+# ════════════════════════════════════════════════════════════════════════════
+
+# ── Visualisation constants ───────────────────────────────────────────────────
+_VIS_SCORE_COLS = ["CNNaffinity", "minimizedAffinity", "CNNscore"]
+
+_VIS_SCORE_LABELS = {
+    "CNNaffinity":       "CNN Affinity  (–log Kd/Ki)  ↑ higher = better",
+    "minimizedAffinity": "Vinardo Score  (kcal mol⁻¹)  ↓ more negative = better",
+    "CNNscore":          "CNN Score  (probability)  ↑ higher = better",
+}
+
+_VIS_LOWER_IS_BETTER = {"minimizedAffinity"}
+
+_VIS_PANEL_COLORS = {
+    "CNNaffinity":       "#2E86AB",   # steel blue
+    "minimizedAffinity": "#E84855",   # crimson
+    "CNNscore":          "#3BB273",   # green
+}
+
+_VIS_RANK_COLORS = {
+    1: "#D4A017",   # gold
+    2: "#8A8A8A",   # silver
+    3: "#A0522D",   # bronze
+}
+
+
+def _draw_table(ax: plt.Axes, df_plot: pd.DataFrame) -> None:
+    """Draw a styled summary table into ax (called by _make_barchart_figure)."""
+    ax.axis("off")
+
+    tbl_data = []
+    for _, row in df_plot.iterrows():
+        smi = textwrap.shorten(str(row["smiles"]), width=30, placeholder="…")
+        tbl_data.append([
+            str(int(row["rank"])),
+            row["mol_label"],
+            f"{row['CNNaffinity']:.3f}",
+            f"{row['minimizedAffinity']:.3f}",
+            f"{row['CNNscore']:.3f}",
+            smi,
+        ])
+
+    headers = ["Rank", "Molecule", "CNNaff ↑", "Vinardo ↓", "CNNsc ↑", "SMILES"]
+    col_w   = [0.06, 0.17, 0.11, 0.11, 0.09, 0.46]
+
+    tbl = ax.table(cellText=tbl_data, colLabels=headers,
+                   loc="center", cellLoc="center")
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(7)
+
+    for j in range(len(headers)):
+        c = tbl[0, j]
+        c.set_facecolor("#1A1A2E")
+        c.set_text_props(color="white", fontweight="bold", fontsize=7.5)
+        c.set_edgecolor("#FAFAFA")
+        c.set_width(col_w[j])
+
+    hi = ["#D4A017", "#8A8A8A", "#A0522D"]   # gold / silver / bronze
+    for ri in range(1, len(tbl_data) + 1):
+        for ci in range(len(headers)):
+            cell = tbl[ri, ci]
+            if ri <= 3:
+                cell.set_facecolor(hi[ri - 1] + "44")
+                cell.set_text_props(fontweight="bold")
+            elif ri % 2 == 0:
+                cell.set_facecolor("#F0F4F8")
+            else:
+                cell.set_facecolor("#FFFFFF")
+            cell.set_edgecolor("#E0E0E0")
+            cell.set_width(col_w[ci])
+
+    ax.set_title("Summary Table  (best pose per molecule)",
+                 fontsize=9, fontweight="bold", pad=6, color="#1A1A2E")
+
+
+def _make_barchart_figure(
+    df_plot: pd.DataFrame,
+    title_tag: str,
+    out_path: str,
+) -> None:
+    """
+    Build one complete figure:
+      LEFT  — 3 horizontal bar chart panels (one per GNINA score)
+      RIGHT — styled summary table
+      BOTTOM — colour-key legend strip
+
+    Bars are gold/silver/bronze for ranks 1/2/3; panel colour otherwise.
+    Numeric values are printed at the end of every bar.
+    Figure height auto-scales with the number of molecules.
+    """
+    n     = len(df_plot)
+    row_h = 0.54 if n <= 10 else 0.38
+    fig_h = max(7.5, n * row_h + 3.8)
+
+    fig = plt.figure(figsize=(20, fig_h), facecolor="#FAFAFA")
+
+    outer = gridspec.GridSpec(
+        2, 1, figure=fig,
+        height_ratios=[1, 0.001], hspace=0,
+        left=0.01, right=0.99, top=0.93, bottom=0.09,
+    )
+    inner = gridspec.GridSpecFromSubplotSpec(
+        1, 4, subplot_spec=outer[0],
+        width_ratios=[1, 1, 1, 1.65], wspace=0.10,
+    )
+    axes_bar = [fig.add_subplot(inner[0, i]) for i in range(3)]
+    ax_table = fig.add_subplot(inner[0, 3])
+
+    fig.suptitle(
+        f"BRD4 Molecular Docking — Scores per Molecule  [{title_tag}]",
+        fontsize=14, fontweight="bold", y=0.97, color="#1A1A2E",
+    )
+
+    y_pos    = np.arange(n)
+    y_labels = df_plot["mol_label"].tolist()
+
+    for i, col in enumerate(_VIS_SCORE_COLS):
+        ax    = axes_bar[i]
+        color = _VIS_PANEL_COLORS[col]
+        vals  = df_plot[col].values
+
+        bar_colors = [
+            _VIS_RANK_COLORS.get(int(row["rank"]), color)
+            for _, row in df_plot.iterrows()
+        ]
+
+        if col in _VIS_LOWER_IS_BETTER:
+            ax.axvline(0, color="#999999", linewidth=0.8, alpha=0.5)
+
+        ax.barh(y_pos, vals, color=bar_colors,
+                edgecolor="white", linewidth=0.5,
+                height=0.65, alpha=0.88)
+
+        x_range = float(np.nanmax(np.abs(vals))) or 1.0
+        offset  = x_range * 0.025
+        for yi, v in zip(y_pos, vals):
+            if not np.isfinite(v):
+                continue
+            ha   = "left"  if v >= 0 else "right"
+            xpos = v + (offset if v >= 0 else -offset)
+            ax.text(xpos, yi, f"{v:.2f}",
+                    va="center", ha=ha, fontsize=6.8, color="#222222",
+                    fontweight="bold" if yi < 3 else "normal")
+
+        for yi in y_pos:
+            ax.axhline(yi, color="#EBEBEB", linewidth=0.4, zorder=0)
+
+        ax.set_yticks(y_pos)
+        if i == 0:
+            ax.set_yticklabels(y_labels, fontsize=7.5, color="#222222")
+        else:
+            ax.set_yticklabels([])
+
+        ax.invert_yaxis()
+        ax.set_xlabel(_VIS_SCORE_LABELS[col], fontsize=8, labelpad=5)
+        ax.tick_params(axis="x", labelsize=7.5)
+        ax.spines[["top", "right"]].set_visible(False)
+        ax.spines["left"].set_color("#CCCCCC")
+        ax.spines["bottom"].set_color("#AAAAAA")
+        ax.set_facecolor("#FAFAFA")
+        ax.xaxis.set_major_formatter(mticker.FormatStrFormatter("%.1f"))
+
+        direction = "▼ lower = better" if col in _VIS_LOWER_IS_BETTER else "▲ higher = better"
+        ax.set_title(f"{col}\n{direction}",
+                     fontsize=9, fontweight="bold", color=color, pad=4)
+
+    axes_bar[0].set_ylabel("Molecule  (ranked by CNN affinity)",
+                            fontsize=9, labelpad=8, color="#555")
+
+    _draw_table(ax_table, df_plot)
+
+    ax_leg = fig.add_axes([0.13, 0.01, 0.55, 0.055])
+    ax_leg.axis("off")
+    legend_patches = [
+        mpatches.Patch(color=_VIS_RANK_COLORS[1], label="Rank 1  (best)"),
+        mpatches.Patch(color=_VIS_RANK_COLORS[2], label="Rank 2"),
+        mpatches.Patch(color=_VIS_RANK_COLORS[3], label="Rank 3"),
+        mpatches.Patch(color="#2E86AB", alpha=0.7, label="Other — CNNaffinity panel"),
+        mpatches.Patch(color="#E84855", alpha=0.7, label="Other — Vinardo panel"),
+        mpatches.Patch(color="#3BB273", alpha=0.7, label="Other — CNNscore panel"),
+    ]
+    ax_leg.legend(
+        handles=legend_patches,
+        loc="center left", ncol=6, fontsize=7.5, frameon=True,
+        framealpha=0.85, edgecolor="#CCCCCC",
+        title="Bar colour key", title_fontsize=7.5,
+    )
+
+    fig.text(
+        0.72, 0.025,
+        "Ranking: CNNaffinity (primary) + Vinardo (tiebreak)\n"
+        "Best pose (pose 1) per molecule | GNINA v1.0.3",
+        fontsize=6.5, color="#888888", style="italic", ha="left", va="center",
+    )
+
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    fig.savefig(out_path, dpi=180, bbox_inches="tight", facecolor="#FAFAFA")
+    plt.close(fig)
+    print(f"  🖼  Saved: {out_path}")
+
+
+def run_visualisation(
+    csv_path:  Optional[str] = None,
+    out_dir:   Optional[str] = None,
+) -> None:
+    """
+    Read docking_summary.csv and produce two ranking bar-chart PNGs:
+      1. Top-10 molecules  → stage6_docking_top10_molecules_all_scores_BARCHART.png
+      2. All molecules     → stage6_docking_all_molecules_all_scores_BARCHART.png
+
+    Ranking: pose-1 CNNaffinity (primary, higher = better)
+             + minimizedAffinity tiebreaker (lower = better, Assumption A12).
+
+    Parameters
+    ----------
+    csv_path : path to docking_summary.csv  (default: config.STAGE6_DIR/docking_summary.csv)
+    out_dir  : directory for PNG output     (default: config.STAGE6_DIR)
+    """
+    warnings.filterwarnings("ignore")
+
+    csv_path = csv_path or os.path.join(config.STAGE6_DIR, "docking_summary.csv")
+    out_dir  = out_dir  or config.STAGE6_DIR
+
+    if not os.path.exists(csv_path):
+        print(f"  ⚠️  docking_summary.csv not found at {csv_path}. "
+              "Skipping visualisation.")
+        return
+
+    df_raw = pd.read_csv(csv_path)
+
+    # Coerce score columns (GNINA writes empty string when a property is missing)
+    for c in _VIS_SCORE_COLS:
+        df_raw[c] = pd.to_numeric(df_raw[c], errors="coerce")
+
+    # Keep best pose only (pose 1 = GNINA top-ranked pose)
+    df = df_raw[df_raw["pose"] == 1].copy().reset_index(drop=True)
+
+    if df.empty:
+        print("  ⚠️  No pose-1 rows found in CSV. Skipping visualisation.")
+        return
+
+    # Rank: CNNaffinity primary (higher = better),
+    #       minimizedAffinity tiebreaker (lower = better → subtract)
+    df["_rank_key"] = df["CNNaffinity"] - 0.01 * df["minimizedAffinity"]
+    df = df.sort_values("_rank_key", ascending=False).reset_index(drop=True)
+    df["rank"] = range(1, len(df) + 1)
+
+    # Clean y-axis label:  "EAM-A-1  mol-3"
+    df["mol_label"] = (
+        df["ligand_group"].str.replace("_", " ", regex=False)
+        + "  mol-" + df["mol_idx"].astype(str)
+    )
+
+    print(f"\n  Visualisation — {len(df)} molecule(s) across "
+          f"{df['ligand_group'].nunique()} group(s)")
+
+    # Figure 1: top 10
+    _make_barchart_figure(
+        df.head(10).copy(),
+        title_tag="Top 10 Molecules",
+        out_path=os.path.join(
+            out_dir,
+            "stage6_docking_top10_molecules_all_scores_BARCHART.png",
+        ),
+    )
+
+    # Figure 2: all molecules
+    _make_barchart_figure(
+        df.copy(),
+        title_tag=f"All {len(df)} Molecules",
+        out_path=os.path.join(
+            out_dir,
+            "stage6_docking_all_molecules_all_scores_BARCHART.png",
+        ),
+    )
+
+    print("  ✅ Visualisation complete.")
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  SELF-CONTAINED TEST  (no real GNINA or GPU required)
 # ════════════════════════════════════════════════════════════════════════════
 
-# Minimal valid multi-pose SDF with two poses and fake GNINA score properties
 _MOCK_SDF = """\
 
      RDKit          3D
@@ -918,7 +1120,6 @@ M  END
 $$$$
 """
 
-# Minimal receptor PDB (just 3 backbone atoms)
 _MOCK_REC_PDB = """\
 ATOM      1  N   ALA A   1       1.000   1.000   1.000  1.00  0.00           N
 ATOM      2  CA  ALA A   1       2.000   1.000   1.000  1.00  0.00           C
@@ -926,15 +1127,10 @@ ATOM      3  C   ALA A   1       3.000   1.000   1.000  1.00  0.00           C
 END
 """
 
-# Minimal original ligand PDB (benzene as autobox reference)
-_MOCK_ORIG_PDB = """\
-HETATM    1  C1  BNZ A   1       0.000   0.000   0.000  1.00  0.00           C
-HETATM    2  C2  BNZ A   1       1.400   0.000   0.000  1.00  0.00           C
-END
-"""
-
 
 def _run_test() -> bool:
+    import stat as stat_mod
+
     print("\n" + "=" * 60)
     print("STAGE 6 SELF-TEST  (mock GNINA, no GPU required)")
     print("=" * 60)
@@ -946,27 +1142,22 @@ def _run_test() -> bool:
     os.makedirs(td)
     print(f"  📁 Created fresh test dir:  {td}\n")
 
-    import json, stat as stat_mod
-
     pred_dir      = os.path.join(td, "preds")
     mask_calc_dir = os.path.join(td, "stage1")
     stage6_dir    = os.path.join(td, "stage6_out")
     pdb_dir       = os.path.join(td, "pdb")
 
-    # ── Write a minimal PDB file ──────────────────────────────────────────────
     os.makedirs(pdb_dir)
     pdb_path = os.path.join(pdb_dir, "3MXF.pdb")
     with open(pdb_path, "w") as f:
         f.write(_MOCK_REC_PDB.replace("END\n", ""))
-        # Add an HETATM for the autobox ligand
         f.write("HETATM    4  C1  JQ1 A   1       5.000   5.000   5.000"
                 "  1.00  0.00           C\n")
         f.write("END\n")
 
-    # ── Write Stage-1 JSON ────────────────────────────────────────────────────
     os.makedirs(mask_calc_dir)
-    lig_id   = "JQ1-A-1"
-    s1_meta  = {
+    lig_id  = "JQ1-A-1"
+    s1_meta = {
         "smiles":              "c1ccccc1",
         "masked_atom_indices": [0, 1],
         "ligand":              {"resname": "JQ1", "chain": "A", "resseq": 1},
@@ -975,23 +1166,20 @@ def _run_test() -> bool:
     with open(os.path.join(mask_calc_dir, "JQ1-A-1.meta.json"), "w") as f:
         json.dump(s1_meta, f)
 
-    # ── Write Stage-2 prediction txt files ───────────────────────────────────
     lig_dir = os.path.join(pred_dir, _safe(lig_id))
     os.makedirs(lig_dir)
-    test_smiles = ["c1ccccc1", "CC(=O)O"]   # benzene, acetic acid
+    test_smiles = ["c1ccccc1", "CC(=O)O"]
     for mc in range(1, 3):
         with open(os.path.join(lig_dir, f"ia_mask{mc:03d}.txt"), "w") as f:
             f.write("\n".join(test_smiles) + "\n")
         with open(os.path.join(lig_dir, f"rand_mask{mc:03d}.txt"), "w") as f:
             f.write(test_smiles[0] + "\n")
 
-    # ── Create mock GNINA binary (shell script that copies mock SDF) ──────────
     mock_sdf_path = os.path.join(td, "mock_poses.sdf")
     with open(mock_sdf_path, "w") as f:
         f.write(_MOCK_SDF)
 
     mock_gnina = os.path.join(td, "mock_gnina")
-    # The script reads --out from its arguments and copies the mock SDF there
     mock_script = (
         "#!/bin/bash\n"
         "OUT=''\n"
@@ -1008,7 +1196,6 @@ def _run_test() -> bool:
              os.stat(mock_gnina).st_mode
              | stat_mod.S_IXUSR | stat_mod.S_IXGRP | stat_mod.S_IXOTH)
 
-    # ── Run Stage 6 ───────────────────────────────────────────────────────────
     passed = 0
     failed = 0
 
@@ -1021,61 +1208,64 @@ def _run_test() -> bool:
             print(f"  ❌ FAIL  {msg}")
             failed += 1
 
+    # ── First run — docks everything fresh ───────────────────────────────────
     results = run_stage6(
-        pred_dir      = pred_dir,
-        mask_calc_dir = mask_calc_dir,
-        stage6_dir    = stage6_dir,
-        gnina_bin     = mock_gnina,
-        n_poses       = 2,
-        pool_choice   = "both",
+        pred_dir=pred_dir, mask_calc_dir=mask_calc_dir,
+        stage6_dir=stage6_dir, gnina_bin=mock_gnina,
+        n_poses=2, pool_choice="both",
     )
 
-    check(lig_id in results,
-          f"'{lig_id}' present in results")
+    check(lig_id in results, f"'{lig_id}' present in results")
 
     if lig_id in results:
         r = results[lig_id]
-        check(r["n_molecules"] > 0,
-              f"pool non-empty (n={r['n_molecules']})")
-        check(r["n_docked"] > 0,
-              f"at least one molecule docked (n={r['n_docked']})")
-        check(os.path.exists(r["csv_path"]),
-              "docking_summary.csv on disk")
+        check(r["n_molecules"] > 0,       f"pool non-empty (n={r['n_molecules']})")
+        check(r["n_docked"]    > 0,       f"at least one molecule docked (n={r['n_docked']})")
+        check(r["n_cached"]    == 0,      "n_cached == 0 on first run")
+        check(r["n_failed"]    == 0,      "n_failed == 0")
+        check(os.path.exists(r["csv_path"]), "docking_summary.csv on disk")
 
-        # Check CSV content
         df = pd.read_csv(r["csv_path"])
-        check(len(df) > 0,
-              f"CSV has rows (got {len(df)})")
-        check(set(["CNNscore", "CNNaffinity", "minimizedAffinity"]).issubset(df.columns),
+        check(len(df) > 0, f"CSV has rows (got {len(df)})")
+        check({"CNNscore", "CNNaffinity", "minimizedAffinity"}.issubset(df.columns),
               "CSV has all three score columns")
-        check("complex_pdb" in df.columns,
-              "CSV has complex_pdb column")
 
-        # Check that complex PDB files were written
-        lig_out = os.path.join(stage6_dir, _safe(lig_id))
+        lig_out  = os.path.join(stage6_dir, _safe(lig_id))
         pdb_files = glob.glob(os.path.join(lig_out, "**", "complex_pose*.pdb"),
-                              recursive=True)
-        check(len(pdb_files) > 0,
-              f"at least one complex PDB written (found {len(pdb_files)})")
+                               recursive=True)
+        check(len(pdb_files) > 0, f"complex PDB files written (found {len(pdb_files)})")
 
-        # Scores should be floats
-        sample_score = df["CNNscore"].dropna()
-        if len(sample_score) > 0:
-            try:
-                float(sample_score.iloc[0])
-                check(True, "CNNscore parses as float")
-            except ValueError:
-                check(False, "CNNscore parses as float")
+        per_mol = (df[df["complex_pdb"] != ""]
+                   .groupby("mol_idx")["complex_pdb"].nunique())
+        if len(per_mol) > 0:
+            check(per_mol.max() <= 2, f"≤ 2 complex PDBs per molecule (max={per_mol.max()})")
 
-        # n_poses=2 → at most 2 complex PDBs per molecule
-        per_mol_counts = (
-            df[df["complex_pdb"] != ""]
-            .groupby("mol_idx")["complex_pdb"]
-            .nunique()
+    # ── Second run — everything should be served from cache ───────────────────
+    results2 = run_stage6(
+        pred_dir=pred_dir, mask_calc_dir=mask_calc_dir,
+        stage6_dir=stage6_dir, gnina_bin=mock_gnina,
+        n_poses=2, pool_choice="both",
+    )
+
+    if lig_id in results2:
+        r2 = results2[lig_id]
+        check(r2["n_docked"] == 0,
+              f"n_docked == 0 on second run (got {r2['n_docked']})")
+        check(r2["n_cached"] == r2["n_molecules"],
+              f"all {r2['n_molecules']} molecules served from cache")
+
+    # ── Visualisation smoke test ──────────────────────────────────────────────
+    if lig_id in results and os.path.exists(results[lig_id]["csv_path"]):
+        vis_dir = os.path.join(td, "vis_out")
+        run_visualisation(
+            csv_path=results[lig_id]["csv_path"],
+            out_dir=vis_dir,
         )
-        if len(per_mol_counts) > 0:
-            check(per_mol_counts.max() <= 2,
-                  f"at most 2 complex PDBs per molecule (max={per_mol_counts.max()})")
+        top10_png = os.path.join(
+            vis_dir,
+            "stage6_docking_top10_molecules_all_scores_BARCHART.png",
+        )
+        check(os.path.exists(top10_png), "top-10 barchart PNG produced")
 
     print(f"\n{'='*60}")
     print(f"Test complete:  {passed} passed,  {failed} failed.")
@@ -1095,13 +1285,14 @@ def main():
 
     print(f"""
   This stage docks all generated molecules (from Stage 2) into the BRD4
-  binding pocket using GNINA with autobox.
+  binding pocket using GNINA with autobox, then produces ranking plots.
 
   GNINA binary : {config.GNINA_BINARY}
   (Auto-downloaded from GitHub v1.0.3 if not found.)
 
   ⚠️  GNINA is Linux/x86_64 only. On macOS / Windows use WSL.
   ⚠️  GPU (CUDA) is strongly recommended; CPU docking is very slow.
+  ⚠️  Already-docked molecules are skipped automatically (cached ✓).
 
   Before running the full pipeline you can run a smoke test instead.
   The smoke test uses a mock GNINA script — no binary, no GPU needed.
@@ -1131,13 +1322,23 @@ def main():
     results = run_stage6(n_poses=n_poses, pool_choice=pool)
 
     print("\n" + "=" * 60)
-    print("✅ Stage 6 complete.")
+    print("✅ Docking complete.")
     print(f"   Outputs saved to : {config.STAGE6_DIR}")
     print(f"   Summary CSV      : {os.path.join(config.STAGE6_DIR, 'docking_summary.csv')}")
     print(f"   Ligands processed: {len(results)}")
     for lig_id, r in sorted(results.items()):
         print(f"   • {lig_id}  docked={r['n_docked']}  "
-              f"failed={r['n_failed']}")
+              f"cached={r['n_cached']}  failed={r['n_failed']}")
+
+    # ── Visualisation ─────────────────────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("STAGE 6 VISUALISATION")
+    print("=" * 60)
+    run_visualisation()
+
+    print("\n" + "=" * 60)
+    print("✅ Stage 6 complete.")
+    print(f"   Plots saved to: {config.STAGE6_DIR}")
 
 
 if __name__ == "__main__":
