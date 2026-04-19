@@ -23,10 +23,9 @@ Per ligand group (e.g. EAM-A-1), produces:
       columns: ligand_group, mol_idx, smiles, pose, CNNscore,
                CNNaffinity, minimizedAffinity, complex_pdb
 
-After docking, a ranked PDF table is saved to the nested output dir:
-  docking_results_table.pdf
-      Columns: Rank | SMILES | CNNaffinity | CNNscore | Vinardo
-      Ranked by CNNaffinity x CNNscore (both higher = better)
+After docking, two visualisation PNGs are saved to STAGE6_DIR:
+  stage6_docking_top10_molecules_all_scores_BARCHART.png
+  stage6_docking_all_molecules_all_scores_BARCHART.png
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ASSUMPTIONS
@@ -112,10 +111,16 @@ import warnings
 from collections import defaultdict
 from typing import Dict, Iterable, List, Optional, Tuple
 
+import matplotlib
+matplotlib.use("Agg")   # non-interactive — safe in Colab and headless
+import matplotlib.gridspec as gridspec
+import matplotlib.patches as mpatches
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+import numpy as np
 import pandas as pd
-from rdkit import Chem, RDLogger
+from rdkit import Chem
 from rdkit.Chem import AllChem
-RDLogger.DisableLog("rdApp.*")   # suppress RDKit 2D/3D and other noise warnings
 
 import config
 from stage4_br4_matching import _safe, load_pool_for_ligand
@@ -773,7 +778,7 @@ def run_stage6(
                     gnina_bin=gnina_bin, receptor=rec_pdb,
                     ligand=lig_sdf, autobox=orig_pdb,
                     out_sdf=out_sdf, log_file=log_file,
-                    n_poses=n_poses,   # user-chosen; same value used for write
+                    n_poses=9,   # always generate 9; filter on write
                 )
                 if not ok:
                     print("Docking failed. Skipped.")
@@ -830,31 +835,225 @@ def run_stage6(
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  RESULTS TABLE  (PDF — replaces bar-chart visualisation)
+#  VISUALISATION
 # ════════════════════════════════════════════════════════════════════════════
+
+# ── Visualisation constants ───────────────────────────────────────────────────
+_VIS_SCORE_COLS = ["CNNaffinity", "minimizedAffinity", "CNNscore"]
+
+_VIS_SCORE_LABELS = {
+    "CNNaffinity":       "CNN Affinity  (–log Kd/Ki)  ↑ higher = better",
+    "minimizedAffinity": "Vinardo Score  (kcal mol⁻¹)  ↓ more negative = better",
+    "CNNscore":          "CNN Score  (probability)  ↑ higher = better",
+}
+
+_VIS_LOWER_IS_BETTER = {"minimizedAffinity"}
+
+_VIS_PANEL_COLORS = {
+    "CNNaffinity":       "#2E86AB",   # steel blue
+    "minimizedAffinity": "#E84855",   # crimson
+    "CNNscore":          "#3BB273",   # green
+}
+
+_VIS_RANK_COLORS = {
+    1: "#D4A017",   # gold
+    2: "#8A8A8A",   # silver
+    3: "#A0522D",   # bronze
+}
+
+
+def _draw_table(ax: plt.Axes, df_plot: pd.DataFrame) -> None:
+    """Draw a styled summary table into ax (called by _make_barchart_figure)."""
+    ax.axis("off")
+
+    tbl_data = []
+    for _, row in df_plot.iterrows():
+        smi = textwrap.shorten(str(row["smiles"]), width=30, placeholder="…")
+        tbl_data.append([
+            str(int(row["rank"])),
+            row["mol_label"],
+            f"{row['CNNaffinity']:.3f}",
+            f"{row['minimizedAffinity']:.3f}",
+            f"{row['CNNscore']:.3f}",
+            smi,
+        ])
+
+    headers = ["Rank", "Molecule", "CNNaff ↑", "Vinardo ↓", "CNNsc ↑", "SMILES"]
+    col_w   = [0.06, 0.17, 0.11, 0.11, 0.09, 0.46]
+
+    tbl = ax.table(cellText=tbl_data, colLabels=headers,
+                   loc="center", cellLoc="center")
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(7)
+
+    for j in range(len(headers)):
+        c = tbl[0, j]
+        c.set_facecolor("#1A1A2E")
+        c.set_text_props(color="white", fontweight="bold", fontsize=7.5)
+        c.set_edgecolor("#FAFAFA")
+        c.set_width(col_w[j])
+
+    hi = ["#D4A017", "#8A8A8A", "#A0522D"]   # gold / silver / bronze
+    for ri in range(1, len(tbl_data) + 1):
+        for ci in range(len(headers)):
+            cell = tbl[ri, ci]
+            if ri <= 3:
+                cell.set_facecolor(hi[ri - 1] + "44")
+                cell.set_text_props(fontweight="bold")
+            elif ri % 2 == 0:
+                cell.set_facecolor("#F0F4F8")
+            else:
+                cell.set_facecolor("#FFFFFF")
+            cell.set_edgecolor("#E0E0E0")
+            cell.set_width(col_w[ci])
+
+    ax.set_title("Summary Table  (best pose per molecule)",
+                 fontsize=9, fontweight="bold", pad=6, color="#1A1A2E")
+
+
+def _make_barchart_figure(
+    df_plot: pd.DataFrame,
+    title_tag: str,
+    out_path: str,
+) -> None:
+    """
+    Build one complete figure:
+      LEFT  — 3 horizontal bar chart panels (one per GNINA score)
+      RIGHT — styled summary table
+      BOTTOM — colour-key legend strip
+
+    Bars are gold/silver/bronze for ranks 1/2/3; panel colour otherwise.
+    Numeric values are printed at the end of every bar.
+    Figure height auto-scales with the number of molecules.
+    """
+    n     = len(df_plot)
+    row_h = 0.54 if n <= 10 else 0.38
+    fig_h = max(7.5, n * row_h + 3.8)
+
+    fig = plt.figure(figsize=(20, fig_h), facecolor="#FAFAFA")
+
+    outer = gridspec.GridSpec(
+        2, 1, figure=fig,
+        height_ratios=[1, 0.001], hspace=0,
+        left=0.01, right=0.99, top=0.93, bottom=0.09,
+    )
+    inner = gridspec.GridSpecFromSubplotSpec(
+        1, 4, subplot_spec=outer[0],
+        width_ratios=[1, 1, 1, 1.65], wspace=0.10,
+    )
+    axes_bar = [fig.add_subplot(inner[0, i]) for i in range(3)]
+    ax_table = fig.add_subplot(inner[0, 3])
+
+    fig.suptitle(
+        f"BRD4 Molecular Docking — Scores per Molecule  [{title_tag}]",
+        fontsize=14, fontweight="bold", y=0.97, color="#1A1A2E",
+    )
+
+    y_pos    = np.arange(n)
+    y_labels = df_plot["mol_label"].tolist()
+
+    for i, col in enumerate(_VIS_SCORE_COLS):
+        ax    = axes_bar[i]
+        color = _VIS_PANEL_COLORS[col]
+        vals  = df_plot[col].values
+
+        bar_colors = [
+            _VIS_RANK_COLORS.get(int(row["rank"]), color)
+            for _, row in df_plot.iterrows()
+        ]
+
+        if col in _VIS_LOWER_IS_BETTER:
+            ax.axvline(0, color="#999999", linewidth=0.8, alpha=0.5)
+
+        ax.barh(y_pos, vals, color=bar_colors,
+                edgecolor="white", linewidth=0.5,
+                height=0.65, alpha=0.88)
+
+        x_range = float(np.nanmax(np.abs(vals))) or 1.0
+        offset  = x_range * 0.025
+        for yi, v in zip(y_pos, vals):
+            if not np.isfinite(v):
+                continue
+            ha   = "left"  if v >= 0 else "right"
+            xpos = v + (offset if v >= 0 else -offset)
+            ax.text(xpos, yi, f"{v:.2f}",
+                    va="center", ha=ha, fontsize=6.8, color="#222222",
+                    fontweight="bold" if yi < 3 else "normal")
+
+        for yi in y_pos:
+            ax.axhline(yi, color="#EBEBEB", linewidth=0.4, zorder=0)
+
+        ax.set_yticks(y_pos)
+        if i == 0:
+            ax.set_yticklabels(y_labels, fontsize=7.5, color="#222222")
+        else:
+            ax.set_yticklabels([])
+
+        ax.invert_yaxis()
+        ax.set_xlabel(_VIS_SCORE_LABELS[col], fontsize=8, labelpad=5)
+        ax.tick_params(axis="x", labelsize=7.5)
+        ax.spines[["top", "right"]].set_visible(False)
+        ax.spines["left"].set_color("#CCCCCC")
+        ax.spines["bottom"].set_color("#AAAAAA")
+        ax.set_facecolor("#FAFAFA")
+        ax.xaxis.set_major_formatter(mticker.FormatStrFormatter("%.1f"))
+
+        direction = "▼ lower = better" if col in _VIS_LOWER_IS_BETTER else "▲ higher = better"
+        ax.set_title(f"{col}\n{direction}",
+                     fontsize=9, fontweight="bold", color=color, pad=4)
+
+    axes_bar[0].set_ylabel("Molecule  (ranked by CNN affinity)",
+                            fontsize=9, labelpad=8, color="#555")
+
+    _draw_table(ax_table, df_plot)
+
+    ax_leg = fig.add_axes([0.13, 0.01, 0.55, 0.055])
+    ax_leg.axis("off")
+    legend_patches = [
+        mpatches.Patch(color=_VIS_RANK_COLORS[1], label="Rank 1  (best)"),
+        mpatches.Patch(color=_VIS_RANK_COLORS[2], label="Rank 2"),
+        mpatches.Patch(color=_VIS_RANK_COLORS[3], label="Rank 3"),
+        mpatches.Patch(color="#2E86AB", alpha=0.7, label="Other — CNNaffinity panel"),
+        mpatches.Patch(color="#E84855", alpha=0.7, label="Other — Vinardo panel"),
+        mpatches.Patch(color="#3BB273", alpha=0.7, label="Other — CNNscore panel"),
+    ]
+    ax_leg.legend(
+        handles=legend_patches,
+        loc="center left", ncol=6, fontsize=7.5, frameon=True,
+        framealpha=0.85, edgecolor="#CCCCCC",
+        title="Bar colour key", title_fontsize=7.5,
+    )
+
+    fig.text(
+        0.72, 0.025,
+        "Ranking: CNNaffinity (primary) + Vinardo (tiebreak)\n"
+        "Best pose (pose 1) per molecule | GNINA v1.0.3",
+        fontsize=6.5, color="#888888", style="italic", ha="left", va="center",
+    )
+
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    fig.savefig(out_path, dpi=180, bbox_inches="tight", facecolor="#FAFAFA")
+    plt.close(fig)
+    print(f"  🖼  Saved: {out_path}")
+
 
 def run_visualisation(
     csv_path:  Optional[str] = None,
     out_dir:   Optional[str] = None,
 ) -> None:
     """
-    Read docking_summary.csv, rank all molecules by CNNaffinity × CNNscore
-    (both higher = better; product rewards molecules that score well on both),
-    and write a PDF table:
+    Read docking_summary.csv and produce two ranking bar-chart PNGs:
+      1. Top-10 molecules  → stage6_docking_top10_molecules_all_scores_BARCHART.png
+      2. All molecules     → stage6_docking_all_molecules_all_scores_BARCHART.png
 
-      Columns : Rank | SMILES (full) | CNNaffinity | CNNscore | Vinardo
-      Styling : white header with dark text + bottom border
-                gold tint on rank-1 row
-                alternating white / light-blue rows
-
-    Output: <out_dir>/docking_results_table.pdf
+    Ranking: pose-1 CNNaffinity (primary, higher = better)
+             + minimizedAffinity tiebreaker (lower = better, Assumption A12).
 
     Parameters
     ----------
-    csv_path : path to docking_summary.csv
-    out_dir  : directory for PDF output
+    csv_path : path to docking_summary.csv  (default: config.STAGE6_DIR/docking_summary.csv)
+    out_dir  : directory for PNG output     (default: config.STAGE6_DIR)
     """
-    import warnings
     warnings.filterwarnings("ignore")
 
     csv_path = csv_path or os.path.join(config.STAGE6_DIR, "docking_summary.csv")
@@ -862,127 +1061,58 @@ def run_visualisation(
 
     if not os.path.exists(csv_path):
         print(f"  ⚠️  docking_summary.csv not found at {csv_path}. "
-              "Skipping table generation.")
+              "Skipping visualisation.")
         return
-
-    from reportlab.lib import colors
-    from reportlab.lib.pagesizes import A4, landscape
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.lib.units import cm
-    from reportlab.platypus import (
-        Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle,
-    )
-    import textwrap as _textwrap
-
-    score_cols = ["CNNaffinity", "CNNscore", "minimizedAffinity"]
 
     df_raw = pd.read_csv(csv_path)
-    for c in score_cols:
+
+    # Coerce score columns (GNINA writes empty string when a property is missing)
+    for c in _VIS_SCORE_COLS:
         df_raw[c] = pd.to_numeric(df_raw[c], errors="coerce")
 
-    # Pose 1 only
+    # Keep best pose only (pose 1 = GNINA top-ranked pose)
     df = df_raw[df_raw["pose"] == 1].copy().reset_index(drop=True)
+
     if df.empty:
-        print("  ⚠️  No pose-1 rows found in CSV. Skipping table.")
+        print("  ⚠️  No pose-1 rows found in CSV. Skipping visualisation.")
         return
 
-    # Rank by CNNaffinity × CNNscore (both higher = better)
-    df["_rank_key"] = df["CNNaffinity"] * df["CNNscore"]
+    # Rank: CNNaffinity primary (higher = better),
+    #       minimizedAffinity tiebreaker (lower = better → subtract)
+    df["_rank_key"] = df["CNNaffinity"] - 0.01 * df["minimizedAffinity"]
     df = df.sort_values("_rank_key", ascending=False).reset_index(drop=True)
     df["rank"] = range(1, len(df) + 1)
 
-    print(f"  Table — {len(df)} molecule(s) ranked by CNNaffinity × CNNscore")
-
-    # ── Build PDF ─────────────────────────────────────────────────────────────
-    os.makedirs(out_dir, exist_ok=True)
-    pdf_path = os.path.join(out_dir, "docking_results_table.pdf")
-
-    page_w, page_h = landscape(A4)
-    doc = SimpleDocTemplate(
-        pdf_path,
-        pagesize=landscape(A4),
-        leftMargin=1.2 * cm, rightMargin=1.2 * cm,
-        topMargin=1.2 * cm, bottomMargin=1.2 * cm,
+    # Clean y-axis label:  "EAM-A-1  mol-3"
+    df["mol_label"] = (
+        df["ligand_group"].str.replace("_", " ", regex=False)
+        + "  mol-" + df["mol_idx"].astype(str)
     )
 
-    styles = getSampleStyleSheet()
-    title_style = ParagraphStyle(
-        "DockTitle", parent=styles["Heading1"],
-        fontSize=13, spaceAfter=4, textColor=colors.HexColor("#0A1628"),
+    print(f"\n  Visualisation — {len(df)} molecule(s) across "
+          f"{df['ligand_group'].nunique()} group(s)")
+
+    # Figure 1: top 10
+    _make_barchart_figure(
+        df.head(10).copy(),
+        title_tag="Top 10 Molecules",
+        out_path=os.path.join(
+            out_dir,
+            "stage6_docking_top10_molecules_all_scores_BARCHART.png",
+        ),
     )
-    sub_style = ParagraphStyle(
-        "DockSub", parent=styles["Normal"],
-        fontSize=8.5, textColor=colors.HexColor("#5B7083"), spaceAfter=8,
+
+    # Figure 2: all molecules
+    _make_barchart_figure(
+        df.copy(),
+        title_tag=f"All {len(df)} Molecules",
+        out_path=os.path.join(
+            out_dir,
+            "stage6_docking_all_molecules_all_scores_BARCHART.png",
+        ),
     )
-    cell_style = ParagraphStyle(
-        "Cell", parent=styles["Normal"],
-        fontSize=7, leading=9, wordWrap="CJK",
-    )
 
-    story = []
-
-    story.append(Paragraph("BRD4 Docking Results", title_style))
-    story.append(Paragraph(
-        f"Ranking: CNNaffinity × CNNscore (both higher = better)  ·  "
-        f"Pose 1 per molecule  ·  {len(df)} molecules  ·  "
-        f"CSV: {os.path.basename(csv_path)}",
-        sub_style,
-    ))
-
-    # Column widths: Rank | SMILES | CNNaffinity | CNNscore | Vinardo
-    col_widths = [1.0 * cm, 10.5 * cm, 3.2 * cm, 3.2 * cm, 3.2 * cm]
-
-    header = [
-        Paragraph("<b>Rank</b>", cell_style),
-        Paragraph("<b>SMILES</b>", cell_style),
-        Paragraph("<b>CNNaffinity</b><br/>(higher = better)", cell_style),
-        Paragraph("<b>CNNscore</b><br/>(higher = better)", cell_style),
-        Paragraph("<b>Vinardo</b><br/>(lower = better)", cell_style),
-    ]
-
-    table_data = [header]
-
-    def _fmt(v):
-        try:
-            return f"{float(v):.4f}"
-        except (TypeError, ValueError):
-            return str(v)
-
-    for _, row in df.iterrows():
-        table_data.append([
-            Paragraph(str(int(row["rank"])), cell_style),
-            Paragraph(str(row["smiles"]),    cell_style),
-            Paragraph(_fmt(row["CNNaffinity"]),       cell_style),
-            Paragraph(_fmt(row["CNNscore"]),          cell_style),
-            Paragraph(_fmt(row["minimizedAffinity"]), cell_style),
-        ])
-
-    tbl = Table(table_data, colWidths=col_widths, repeatRows=1)
-    tbl.setStyle(TableStyle([
-        # Header: white bg, dark text, bold, separator line
-        ("BACKGROUND",   (0, 0), (-1, 0), colors.white),
-        ("TEXTCOLOR",    (0, 0), (-1, 0), colors.HexColor("#0A1628")),
-        ("FONTNAME",     (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE",     (0, 0), (-1, 0), 8),
-        ("LINEBELOW",    (0, 0), (-1, 0), 1.2, colors.HexColor("#0A1628")),
-        # Data rows: alternating colours
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1),
-         [colors.HexColor("#F0F6FB"), colors.white]),
-        ("FONTSIZE",     (0, 1), (-1, -1), 7),
-        ("VALIGN",       (0, 0), (-1, -1), "TOP"),
-        ("GRID",         (0, 0), (-1, -1), 0.4, colors.HexColor("#CCCCCC")),
-        ("LEFTPADDING",  (0, 0), (-1, -1), 4),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-        ("TOPPADDING",   (0, 0), (-1, -1), 3),
-        ("BOTTOMPADDING",(0, 0), (-1, -1), 3),
-        # Gold tint on rank-1 row
-        ("BACKGROUND",   (0, 1), (-1, 1), colors.HexColor("#D4A01744")),
-    ]))
-
-    story.append(tbl)
-    doc.build(story)
-
-    print(f"  💾 PDF table saved: {pdf_path}")
+    print("  ✅ Visualisation complete.")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1187,8 +1317,11 @@ def _run_test() -> bool:
             csv_path=results[lig_id]["csv_path"],
             out_dir=vis_dir,
         )
-        pdf_table = os.path.join(vis_dir, "docking_results_table.pdf")
-        check(os.path.exists(pdf_table), "docking_results_table.pdf produced")
+        top10_png = os.path.join(
+            vis_dir,
+            "stage6_docking_top10_molecules_all_scores_BARCHART.png",
+        )
+        check(os.path.exists(top10_png), "top-10 barchart PNG produced")
 
     print(f"\n{'='*60}")
     print(f"Test complete:  {passed} passed,  {failed} failed.")

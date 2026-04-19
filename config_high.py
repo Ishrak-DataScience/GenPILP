@@ -42,8 +42,6 @@ STAGE6_DIR         = f"{_OUT}/stage6_docking/"
 
 #STAGE6_DIR         = f"/content/drive/MyDrive/GenAI4Drug/Mahzabeen/Output/expo02_docking/stage6_docking/"
 STAGE7_DIR = f"{_OUT}/stage7_top_docked/"
-STAGE8_DIR         = f"{_OUT}/stage8_analysis/"               # Stage 8 scatter + Pareto top-10
-STAGE8_INPUT_CSV   = f"{_OUT}/stage6_docking/stage2/both/docking_summary.csv"  # override at prompt if absent
 
 
 # ── GNINA docking binary ───────────────────────────────────────────────────────

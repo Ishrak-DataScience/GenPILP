@@ -406,6 +406,7 @@ def run_stage5(
     threshold:       float = 0.4,
     pchembl_min:     float = 5.0,
     use_cache:       bool  = True,
+    
 ) -> Dict[str, dict]:
     """
     Run Stage-5 ChEMBL BRD4 nearest-neighbour analysis.
@@ -417,8 +418,9 @@ def run_stage5(
     -------
     Dict keyed by ligand_id → same structure as stage4.run_stage4()
     """
-    pred_dir   = pred_dir   or config.PRED_DIR
-    stage5_dir = stage5_dir or config.STAGE5_DIR
+    pred_dir   = pred_dir   
+    # ── FIX: removed 'out_dir' scope error, defaults to config.STAGE5_DIR
+    stage5_dir = stage5_dir or config.STAGE5_DIR 
     cache_path = cache_path or config.CHEMBL_CACHE_PATH
 
     os.makedirs(stage5_dir, exist_ok=True)
@@ -558,6 +560,8 @@ def _run_test() -> bool:
     print("STAGE 5 SELF-TEST  (no network call)")
     print("=" * 60)
 
+    # ── FIX: 'out_dir' was completely undefined here.
+    # Defaulting test folder to config.STAGE5_DIR/test
     td = os.path.join(config.STAGE5_DIR, "test")
     if os.path.exists(td):
         shutil.rmtree(td)
@@ -600,7 +604,7 @@ def _run_test() -> bool:
     # ── Run Stage 5 with use_cache=True (reads the synthetic CSV) ─────────────
     results = run_stage5(
         pred_dir        = pred_dir,
-        stage5_dir      = stage5_dir,
+        stage5_dir      = stage5_dir,        # <── FIX: Changed 'out_dir' to 'stage5_dir'
         cache_path      = cache_path,
         pool_choice     = "both",
         min_heavy_atoms = 7,
@@ -608,7 +612,6 @@ def _run_test() -> bool:
         pchembl_min     = 5.0,
         use_cache       = True,
     )
-
     check(lig_id in results,
           f"'{lig_id}' present in results")
 
@@ -686,6 +689,63 @@ def main():
 
     cache_exists = os.path.exists(config.CHEMBL_CACHE_PATH)
 
+  
+
+    run_test = _ask_yes_no_default("Run the smoke test?", default=False)
+    if run_test:
+        ok = _run_test()
+        sys.exit(0 if ok else 1)
+
+    pool, min_heavy, threshold, pchembl_min, use_cache = ask_stage5_options(
+        cache_exists=cache_exists
+    )
+    # 2. Add prompt for the Data Source (Stage 2, 2.5, or 2.7)
+    print("""
+  Option - Data Source:
+    Which dataset are we analyzing?
+    [1] Standard Stage 2
+    [2] Stage 2.5 (Random Pick)
+    [3] Stage 2.7 (Multi-seed)
+""")
+    while True:
+        choice = input("  Enter 1, 2, or 3 [Default: 1]: ").strip()
+        if choice in ['1', '']:
+            stage_choice = '2'
+            in_dir = config.PRED_DIR
+            break
+        elif choice == '2':
+            stage_choice = '2.5'
+            in_dir = config.STAGE25_PRED_DIR
+            break
+        elif choice == '3':
+            stage_choice = '2.7'
+            in_dir = config.STAGE27_PRED_DIR
+            break
+        else:
+            print("  ❌ Invalid choice. Please enter 1, 2, or 3.")
+  
+   
+    
+    out_dir = os.path.join(
+        config.STAGE5_DIR, 
+        f"generator_Stage{stage_choice}", 
+        str(pool) # Converts your pool choice (e.g., "IA", "Random", "Combined") to a folder name
+    )
+    # 4. Create the nested directories if they don't exist
+    os.makedirs(out_dir, exist_ok=True)
+    print(f"\n  [Data routing: Reading from {in_dir}]")
+    print(f"  [Data routing: Saving to {out_dir}]\n")
+
+    # 5. Run the stage with dynamic paths
+    results = run_stage5(
+        pred_dir        = in_dir,
+        stage5_dir      = out_dir,      # <── FIX: Changed 'out_dir' to 'stage5_dir'
+        pool_choice     = pool,
+        min_heavy_atoms = min_heavy,
+        threshold       = threshold,
+        pchembl_min     = pchembl_min,
+        use_cache       = use_cache,
+    )
     print(f"""
   This stage fetches all BRD4-active compounds from ChEMBL
   (target: {BRD4_CHEMBL_TARGET}) and finds the most similar ChEMBL
@@ -697,30 +757,12 @@ def main():
 
   Before running the full analysis you can run a smoke test instead.
   The smoke test uses a synthetic cache CSV — NO network call is made.
-  Writes to: {os.path.join(config.STAGE5_DIR, "test")}
+   Writes to: {os.path.join(out_dir, "test")}
   (wiped clean at the start of every test run).
 """)
-
-    run_test = _ask_yes_no_default("Run the smoke test?", default=False)
-    if run_test:
-        ok = _run_test()
-        sys.exit(0 if ok else 1)
-
-    pool, min_heavy, threshold, pchembl_min, use_cache = ask_stage5_options(
-        cache_exists=cache_exists
-    )
-
-    results = run_stage5(
-        pool_choice     = pool,
-        min_heavy_atoms = min_heavy,
-        threshold       = threshold,
-        pchembl_min     = pchembl_min,
-        use_cache       = use_cache,
-    )
-
     print("\n" + "=" * 60)
     print("✅ Stage 5 complete.")
-    print(f"   Outputs saved to: {config.STAGE5_DIR}")
+    print(f"   Outputs saved to: {out_dir}")
     print(f"   Ligands analysed: {len(results)}")
     for lig_id, r in sorted(results.items()):
         print(
