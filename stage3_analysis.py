@@ -109,11 +109,26 @@ def _ask_yes_no_default(question: str, default: bool) -> bool:
         print("    Please type 'yes' / 'y' or 'no' / 'n', or press Enter for the default.")
 
 
-def ask_runtime_options() -> Tuple[bool, bool, str]:
+def _ask_pool_choice() -> str:
+    print("""
+  Pool choice — which generated molecules to analyse:
+    ia   : interaction-aware only  (Stage-1 masks)
+    rand : random only             (Stage-1.5 masks)
+    both : IA + random, deduplicated  [default]
+""")
+    while True:
+        raw = input("  Pool choice (ia / rand / both) [both]: ").strip().lower()
+        if raw == "":
+            return "both"
+        if raw in ("ia", "rand", "both"):
+            return raw
+        print("    Please type \'ia\', \'rand\', or \'both\'.")
+
+
+def ask_runtime_options() -> Tuple[bool, bool, str, str]:
     """
-    Ask the two design questions at runtime.
-    Returns (per_mask_count_outputs, deduplicate, stage_choice).
-    Defaults: True, True, '2.7'.
+    Ask all Stage-3 design questions at runtime.
+    Returns (per_mask_count_outputs, deduplicate, stage_choice, pool_choice).
     """
     print("\n" + "─" * 60)
     print("STAGE 3 OPTIONS")
@@ -173,15 +188,18 @@ def ask_runtime_options() -> Tuple[bool, bool, str]:
         else:
             print("  ❌ Invalid choice. Please enter 1, 2, or 3.")
 
+    pool_choice = _ask_pool_choice()
+
     print(f"\n  Settings confirmed:")
     print(f"    Per-mask-count outputs : {'yes' if per_mask else 'no'}")
     print(f"    Deduplicate pool       : {'yes' if deduplicate else 'no'}")
     print(f"    Data Source            : {stage_name}")
+    print(f"    Pool choice            : {pool_choice}")
     print("─" * 60 + "\n")
-    
-    # Notice we are now returning 3 variables instead of 2
-    return per_mask, deduplicate, stage_choice
-   
+
+    return per_mask, deduplicate, stage_choice, pool_choice
+
+
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -749,6 +767,11 @@ def run_analysis_for_group(
         rand_smiles     = rand_list,
     )
 
+    # Compute scores once — used for histogram AND returned for summary boxplot
+    pw_scores = pairwise_tanimoto(smiles_pool) if len(smiles_pool) >= 2 else []
+    vo_scores = (vs_original_tanimoto(smiles_pool, original_smiles)
+                 if original_smiles and smiles_pool else [])
+
     pw_ok = plot_pairwise_histogram(
         smiles_list = smiles_pool,
         title       = f"Pairwise Tanimoto — {label}",
@@ -762,7 +785,12 @@ def run_analysis_for_group(
         out_path        = os.path.join(out_dir, "histogram_vs_original.png"),
     )
 
-    result = {"grid": grid_ok, "pairwise": pw_ok, "vs_original": vo_ok}
+    result = {
+        "grid": grid_ok, "pairwise": pw_ok, "vs_original": vo_ok,
+        # Raw scores for summary boxplot (Option A)
+        "pairwise_scores":    pw_scores,
+        "vs_original_scores": vo_scores,
+    }
 
     # ── New per-strategy outputs ──────────────────────────────────────────────
     # Deduplicate each strategy list independently (the same SMILES can appear
@@ -775,6 +803,9 @@ def run_analysis_for_group(
             out_path        = os.path.join(out_dir, "molecule_grid_ia.png"),
             original_smiles = original_smiles,
         )
+        ia_pw_scores = pairwise_tanimoto(ia_dedup) if len(ia_dedup) >= 2 else []
+        ia_vo_scores = (vs_original_tanimoto(ia_dedup, original_smiles)
+                        if original_smiles and ia_dedup else [])
         result["pairwise_ia"] = plot_pairwise_histogram(
             smiles_list = ia_dedup,
             title       = f"Pairwise Tanimoto (IA only) — {label}",
@@ -786,6 +817,8 @@ def run_analysis_for_group(
             title           = f"vs Original Ligand (IA only) — {label}",
             out_path        = os.path.join(out_dir, "histogram_vs_original_ia.png"),
         )
+        result["pairwise_ia_scores"]    = ia_pw_scores
+        result["vs_original_ia_scores"] = ia_vo_scores
 
     if rand_list is not None:
         rand_dedup = _dedup(rand_list)
@@ -795,6 +828,9 @@ def run_analysis_for_group(
             out_path        = os.path.join(out_dir, "molecule_grid_rand.png"),
             original_smiles = original_smiles,
         )
+        rand_pw_scores = pairwise_tanimoto(rand_dedup) if len(rand_dedup) >= 2 else []
+        rand_vo_scores = (vs_original_tanimoto(rand_dedup, original_smiles)
+                         if original_smiles and rand_dedup else [])
         result["pairwise_rand"] = plot_pairwise_histogram(
             smiles_list = rand_dedup,
             title       = f"Pairwise Tanimoto (random only) — {label}",
@@ -806,6 +842,8 @@ def run_analysis_for_group(
             title           = f"vs Original Ligand (random only) — {label}",
             out_path        = os.path.join(out_dir, "histogram_vs_original_rand.png"),
         )
+        result["pairwise_rand_scores"]    = rand_pw_scores
+        result["vs_original_rand_scores"] = rand_vo_scores
 
     return result
 
@@ -819,6 +857,100 @@ def _safe(s: str) -> str:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  SUMMARY BOXPLOTS (all ligands side by side)
+# ════════════════════════════════════════════════════════════════════════════
+
+def plot_summary_boxplot_stage3(
+    all_results: Dict[str, dict],
+    strategy: str,
+    stage3_dir: str,
+) -> None:
+    """
+    Produce two summary boxplots for a given strategy, placing all ligands
+    side by side so cross-ligand diversity is immediately visible.
+
+    strategy : "ia", "rand", or "both" (merged pool)
+
+    Outputs (saved to stage3_dir/summary_plot_{strategy}/):
+      boxplot_pairwise_tanimoto_{strategy}.png
+          X = ligand ID, Y = pairwise Tanimoto scores
+      boxplot_vs_original_tanimoto_{strategy}.png
+          X = ligand ID, Y = vs-original Tanimoto scores
+    """
+    # Map strategy to the correct score keys in the result dict
+    if strategy == "ia":
+        pw_key = "pairwise_ia_scores"
+        vo_key = "vs_original_ia_scores"
+        tag    = "IA only"
+    elif strategy == "rand":
+        pw_key = "pairwise_rand_scores"
+        vo_key = "vs_original_rand_scores"
+        tag    = "Random only"
+    else:
+        pw_key = "pairwise_scores"
+        vo_key = "vs_original_scores"
+        tag    = "IA + Random (merged)"
+
+    out_dir = os.path.join(stage3_dir, f"summary_plot_{strategy}")
+    os.makedirs(out_dir, exist_ok=True)
+
+    lig_ids = sorted(all_results.keys())
+
+    def _extract(key: str) -> Tuple[List[str], List[List[float]]]:
+        labels, data = [], []
+        for lid in lig_ids:
+            agg = all_results[lid].get("aggregated", {})
+            scores = agg.get(key, [])
+            if scores:
+                labels.append(_safe(lid))
+                data.append(scores)
+        return labels, data
+
+    for metric, key, xlabel, color, fname in [
+        ("Pairwise Tanimoto",       pw_key,
+         "Pairwise Tanimoto Similarity",
+         "#1f77b4",
+         f"boxplot_pairwise_tanimoto_{strategy}.png"),
+        ("vs-Original Tanimoto",    vo_key,
+         "Tanimoto Similarity to Original Ligand",
+         "#ff7f0e",
+         f"boxplot_vs_original_tanimoto_{strategy}.png"),
+    ]:
+        labels, data = _extract(key)
+        if not data:
+            print(f"  ⚠️  Summary boxplot ({metric}, {strategy}): no data. Skipped.")
+            continue
+
+        fig, ax = plt.subplots(figsize=(max(8, len(labels) * 1.6), 6),
+                               facecolor="#FAFAFA")
+        bp = ax.boxplot(data, patch_artist=True, tick_labels=labels,
+                        medianprops=dict(color="red", linewidth=2))
+        for patch in bp["boxes"]:
+            patch.set_facecolor(color)
+            patch.set_alpha(0.6)
+
+        ax.set_xlabel("Ligand Group", fontsize=11)
+        ax.set_ylabel(xlabel, fontsize=11)
+        ax.set_title(
+            f"{metric} — All Ligands  ({tag})\n"
+            f"Stage 3 summary  (N={len(labels)} groups)",
+            fontsize=12, fontweight="bold",
+        )
+        ax.set_ylim(0, 1)
+        ax.axhline(0.4, color="#AAAAAA", linestyle="--",
+                   linewidth=0.8, label="T = 0.40 reference")
+        ax.legend(fontsize=9)
+        ax.grid(True, axis="y", linestyle="--", alpha=0.35)
+        ax.set_facecolor("#FAFAFA")
+        plt.xticks(rotation=30, ha="right")
+        plt.tight_layout()
+        out_path = os.path.join(out_dir, fname)
+        plt.savefig(out_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  🖼  {os.path.basename(out_path)}")
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  MAIN ANALYSIS FUNCTION
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -828,6 +960,7 @@ def run_stage3(
     stage3_dir:     Optional[str] = None,
     per_mask_count: bool = True,
     deduplicate:    bool = True,
+    pool_choice:    str  = "both",
 ) -> Dict[str, dict]:
     """
     Run Stage-3 analysis.
@@ -839,6 +972,7 @@ def run_stage3(
     stage3_dir     : output root for this stage   (default: config.STAGE3_DIR)
     per_mask_count : also produce per-step outputs
     deduplicate    : deduplicate pooled IA + random SMILES
+    pool_choice    : "ia", "rand", or "both" — which strategies to include
 
     Returns
     -------
@@ -888,18 +1022,20 @@ def run_stage3(
         mask_counts = sorted(predictions.keys())
         lig_out_dir = os.path.join(stage3_dir, _safe(lig_id))
 
-        # ── Aggregated: pool all mask counts together ─────────────────────────
-        all_ia   = [smi for mc in mask_counts for smi in predictions[mc]["ia"]]
-        all_rand = [smi for mc in mask_counts for smi in predictions[mc]["rand"]]
+        # ── Aggregated: pool all mask counts, filtered by pool_choice ─────────
+        all_ia   = ([smi for mc in mask_counts for smi in predictions[mc]["ia"]]
+                    if pool_choice in ("ia", "both") else [])
+        all_rand = ([smi for mc in mask_counts for smi in predictions[mc]["rand"]]
+                    if pool_choice in ("rand", "both") else [])
         agg_pool = pool_smiles(all_ia, all_rand, deduplicate)
 
         agg_result = run_analysis_for_group(
             smiles_pool     = agg_pool,
             original_smiles = orig,
-            label           = f"{lig_id} — aggregated (all masks, N={len(mask_counts)})",
+            label           = f"{lig_id} — aggregated (all masks, N={len(mask_counts)}, pool={pool_choice})",
             out_dir         = os.path.join(lig_out_dir, "aggregated"),
-            ia_list         = all_ia,
-            rand_list       = all_rand,
+            ia_list         = all_ia if pool_choice in ("ia", "both") else None,
+            rand_list       = all_rand if pool_choice in ("rand", "both") else None,
         )
 
         per_mc_results: Dict[int, dict] = {}
@@ -907,18 +1043,16 @@ def run_stage3(
         # ── Per-mask-count ────────────────────────────────────────────────────
         if per_mask_count:
             for mc in mask_counts:
-                pool = pool_smiles(
-                    predictions[mc]["ia"],
-                    predictions[mc]["rand"],
-                    deduplicate,
-                )
+                mc_ia   = predictions[mc]["ia"]   if pool_choice in ("ia",   "both") else []
+                mc_rand = predictions[mc]["rand"]  if pool_choice in ("rand", "both") else []
+                pool = pool_smiles(mc_ia, mc_rand, deduplicate)
                 mc_result = run_analysis_for_group(
                     smiles_pool     = pool,
                     original_smiles = orig,
-                    label           = f"{lig_id} — mask_count={mc}",
+                    label           = f"{lig_id} — mask_count={mc} ({pool_choice})",
                     out_dir         = os.path.join(lig_out_dir, f"mask_{mc:03d}"),
-                    ia_list         = predictions[mc]["ia"],
-                    rand_list       = predictions[mc]["rand"],
+                    ia_list         = mc_ia   if pool_choice in ("ia",   "both") else None,
+                    rand_list       = mc_rand if pool_choice in ("rand", "both") else None,
                 )
                 per_mc_results[mc] = mc_result
 
@@ -942,6 +1076,16 @@ def run_stage3(
             "agg_pool_size": len(agg_pool),
             "curve_path":    curve_path,
         }
+
+    # ── Summary boxplots: all ligands side by side ───────────────────────────
+    # Dispatch is driven directly by pool_choice (not inferred from score keys):
+    #   pool_choice = "ia"   → 2 plots in summary_plot_ia/
+    #   pool_choice = "rand" → 2 plots in summary_plot_rand/
+    #   pool_choice = "both" → 4 plots: summary_plot_ia/ + summary_plot_rand/
+    if pool_choice in ("ia", "both"):
+        plot_summary_boxplot_stage3(all_results, "ia", stage3_dir)
+    if pool_choice in ("rand", "both"):
+        plot_summary_boxplot_stage3(all_results, "rand", stage3_dir)
 
     return all_results
 
@@ -1114,7 +1258,7 @@ def main():
         ok = _run_test()
         sys.exit(0 if ok else 1)
 
-    per_mask_count, deduplicate, stage_choice = ask_runtime_options()
+    per_mask_count, deduplicate, stage_choice, pool_choice = ask_runtime_options()
     # 2. Route paths based on user choice pulling directly from config
     if stage_choice == '25':
         in_dir  = config.STAGE25_PRED_DIR  # <-- Change if your config name differs
@@ -1134,6 +1278,7 @@ def main():
         stage3_dir     = out_dir,
         per_mask_count = per_mask_count,
         deduplicate    = deduplicate,
+        pool_choice    = pool_choice,
     )
 
     print("\n" + "=" * 60)

@@ -168,6 +168,9 @@ def generate_random_mask_json(
         "plip_xml":            stage1.get("plip_xml", ""),
     }
 
+    from bpe_mask_adapter import build_smiles_mask_json_fields
+    random_meta.update(build_smiles_mask_json_fields(smiles, random_indices))
+
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(random_meta, f, indent=2)

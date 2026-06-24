@@ -45,7 +45,7 @@ A5. If Stage-1 and Stage-1.5 lists have different lengths (should not
     happen if Stage 1.5 ran correctly), the shorter length is used and
     a warning is printed.
 
-A6. INCREMENTAL_NUM_SAMPLES ChemBERTa samples are drawn per
+A6. config.INCREMENTAL_NUM_SAMPLES ChemBERTa samples are drawn per
     (ligand, mask_count, strategy) cell — NOT averaged over multiple
     random subsets. (Ambiguity 2 → Option A)
 
@@ -75,7 +75,6 @@ The test:
   4. Prints PASS / FAIL for each assertion.
 """
 
-import argparse
 import glob
 import json
 import os
@@ -83,6 +82,8 @@ import shutil
 import sys
 from typing import Dict, List, Optional, Tuple
 
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
 from rdkit import Chem
@@ -117,6 +118,115 @@ def load_chemberta(model_name: str = config.CHEMBERTA_MODEL):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  RDKIT LOGIT FILTERING — helpers
+# ════════════════════════════════════════════════════════════════════════════
+
+import re as _re
+
+# Regex matching any token that can appear in a valid SMILES string.
+# Covers: multi-char elements, single-char atoms, aromatic atoms, bond
+# symbols, branches, ring closures, bracket atoms, charge marks.
+_SMILES_TOKEN_RE = _re.compile(
+    r"^(?:"
+    r"Br|Cl|Si|Se|As|Te|Na|Li|Ca|Mg|Fe|Zn|Cu|Mn|Co|Ni|Pd|Pt|Al|Sn|Bi|Hg|Cr|"
+    r"[BCNOFPSIbcnops]|"          # single-char aliphatic / aromatic atoms
+    r"[=:#.\/\\]|"                  # bond symbols
+    r"[\(\)]|"                      # branch open/close
+    r"[1-9]|%[1-9][0-9]|"          # ring-closure digits
+    r"\[(?:[^\[\]])*\]|"            # bracket atoms  e.g. [NH2+]
+    r"[+\-]"                        # explicit charge tokens
+    r")$"
+)
+
+# Per-tokenizer cache: tokenizer id → CPU bool tensor (vocab_size,)
+_SMILES_VOCAB_MASK_CACHE: dict = {}
+
+
+def _build_smiles_vocab_mask(tokenizer) -> "torch.Tensor":
+    """
+    Return a boolean CPU tensor of shape (vocab_size,) where True marks
+    tokens that are legal SMILES fragments.  Built once per tokenizer and
+    cached for the lifetime of the process.
+    """
+    key = id(tokenizer)
+    if key in _SMILES_VOCAB_MASK_CACHE:
+        return _SMILES_VOCAB_MASK_CACHE[key]
+
+    vocab_size = tokenizer.vocab_size or len(tokenizer.get_vocab())
+    mask = torch.zeros(vocab_size, dtype=torch.bool)
+
+    # Always allow all special tokens (MASK, PAD, CLS, SEP, UNK, EOS, BOS)
+    special_ids = {
+        tokenizer.cls_token_id, tokenizer.sep_token_id,
+        tokenizer.pad_token_id, tokenizer.unk_token_id,
+        tokenizer.mask_token_id,
+        getattr(tokenizer, "eos_token_id", None),
+        getattr(tokenizer, "bos_token_id", None),
+    } - {None}
+    for sid in special_ids:
+        if 0 <= sid < vocab_size:
+            mask[sid] = True
+
+    for token, idx in tokenizer.get_vocab().items():
+        if idx >= vocab_size:
+            continue
+        t = token.strip()
+        if t and _SMILES_TOKEN_RE.match(t):
+            mask[idx] = True
+
+    _SMILES_VOCAB_MASK_CACHE[key] = mask
+    return mask
+
+
+def _partial_smiles_valid(ids: "torch.Tensor", tokenizer) -> bool:
+    """
+    Lightweight structural check on a partially-filled token sequence.
+    Decodes the current ids to a string and verifies:
+      • Parenthesis depth never goes negative (no premature close)
+      • Bracket depth never goes negative
+      • Each ring-closure digit appears at most twice
+
+    Does NOT call RDKit — fast enough to run once per candidate per position.
+    Returns True when the partial string is still structurally consistent.
+    """
+    try:
+        partial = tokenizer.decode(ids, skip_special_tokens=True).replace(" ", "")
+    except Exception:
+        return True  # decoding failed — don't penalise
+
+    paren_depth   = 0
+    bracket_depth = 0
+    ring_counts: dict = {}
+    i = 0
+    while i < len(partial):
+        c = partial[i]
+        if c == "(":
+            paren_depth += 1
+        elif c == ")":
+            paren_depth -= 1
+            if paren_depth < 0:
+                return False
+        elif c == "[":
+            bracket_depth += 1
+        elif c == "]":
+            bracket_depth -= 1
+            if bracket_depth < 0:
+                return False
+        elif c == "%" and i + 2 < len(partial) and partial[i + 1: i + 3].isdigit():
+            rnum = partial[i: i + 3]
+            ring_counts[rnum] = ring_counts.get(rnum, 0) + 1
+            if ring_counts[rnum] > 2:
+                return False
+            i += 2  # skip the two digit chars
+        elif c.isdigit() and bracket_depth == 0:
+            ring_counts[c] = ring_counts.get(c, 0) + 1
+            if ring_counts[c] > 2:
+                return False
+        i += 1
+    return True
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  SEQUENTIAL ChemBERTa GENERATION
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -130,12 +240,31 @@ def generate_smiles_sequential(
     num_samples: int = config.INCREMENTAL_NUM_SAMPLES,
     temperature: float = config.TEMPERATURE,
     save_path: Optional[str] = None,
+    rdkit_logit_filter: bool = True,
 ) -> List[str]:
     """
     Sequentially fill all <mask> tokens in smiles_masked left-to-right.
     Each fill is conditioned on all previously filled tokens.
 
-    Returns a sorted list of unique valid SMILES.
+    RDKit logit filtering (rdkit_logit_filter=True, default):
+      At every mask position two filtering passes are applied before sampling:
+
+      Pass 1 — Vocabulary whitelist:
+        Logits for tokens that are not valid SMILES fragments (according to
+        _SMILES_TOKEN_RE) are set to -inf.  This eliminates word-piece tokens
+        like "##ing" or "protein" that ChemBERTa would otherwise sample.
+
+      Pass 2 — Structural consistency check:
+        For each candidate in the surviving top-k, the partial decoded string
+        is tested with _partial_smiles_valid().  Tokens that would create an
+        unbalanced parenthesis, bracket, or a ring-closure digit appearing more
+        than twice are masked out.  If ALL candidates fail this check the pass
+        is skipped (fall-back to Pass-1 result) to avoid dead-ends.
+
+    Both passes are zero-cost in terms of extra model forward passes — they
+    operate only on the logit tensor already produced by the model.
+
+    Returns a sorted list of unique RDKit-valid SMILES.
     Optionally saves them to save_path (one per line).
     """
     max_len = getattr(tokenizer, "model_max_length", 512)
@@ -151,25 +280,58 @@ def generate_smiles_sequential(
 
     mask_positions = (base_ids == mask_id).nonzero(as_tuple=True)[0].tolist()
     if not mask_positions:
-        # Input has no masks — just validate the literal string
         clean = smiles_masked.replace(" ", "")
         if Chem.MolFromSmiles(clean) is not None:
             return [clean]
         return []
+
+    # Build vocab mask once (cached after first call for this tokenizer)
+    if rdkit_logit_filter:
+        vocab_mask = _build_smiles_vocab_mask(tokenizer).to(device)
 
     valid_set: set = set()
     invalid   = 0
 
     for _ in range(num_samples):
         ids = base_ids.clone()
+
         for pos in mask_positions:
-            out     = model(input_ids=ids.unsqueeze(0), attention_mask=base_attn.unsqueeze(0))
-            logits  = out.logits[0, pos] / max(temperature, 1e-8)
-            probs   = torch.softmax(logits, dim=-1)
-            topk    = torch.topk(probs, k=top_k)
-            top_p   = topk.values / topk.values.sum()
-            sampled = torch.multinomial(top_p, num_samples=1).item()
-            ids[pos] = topk.indices[sampled]
+            out    = model(input_ids=ids.unsqueeze(0),
+                           attention_mask=base_attn.unsqueeze(0))
+            logits = out.logits[0, pos] / max(temperature, 1e-8)
+
+            if rdkit_logit_filter:
+                # ── Pass 1: zero non-SMILES tokens ──────────────────────────
+                logits = logits.masked_fill(~vocab_mask, float("-inf"))
+
+                # ── Pass 2: structural consistency filter ────────────────────
+                k = min(top_k, int(vocab_mask.sum().item()), logits.shape[0])
+                k = max(k, 1)
+                topk = torch.topk(logits, k=k)
+
+                struct_ok = torch.ones(k, dtype=torch.bool, device=device)
+                for ci in range(k):
+                    test_ids = ids.clone()
+                    test_ids[pos] = topk.indices[ci]
+                    if not _partial_smiles_valid(test_ids, tokenizer):
+                        struct_ok[ci] = False
+
+                # Fall back to Pass-1 result if every candidate fails Pass 2
+                if not struct_ok.any():
+                    struct_ok = torch.ones(k, dtype=torch.bool, device=device)
+
+                filtered_logits = topk.values.masked_fill(~struct_ok, float("-inf"))
+                top_p  = torch.softmax(filtered_logits, dim=-1)
+                chosen = torch.multinomial(top_p, num_samples=1).item()
+                ids[pos] = topk.indices[chosen]
+
+            else:
+                # Original unfiltered sampling
+                probs   = torch.softmax(logits, dim=-1)
+                topk    = torch.topk(probs, k=top_k)
+                top_p   = topk.values / topk.values.sum()
+                chosen  = torch.multinomial(top_p, num_samples=1).item()
+                ids[pos] = topk.indices[chosen]
 
         cand = tokenizer.decode(ids, skip_special_tokens=True).replace(" ", "")
         if Chem.MolFromSmiles(cand) is not None:
@@ -374,9 +536,14 @@ def run_generation(
     pred_dir:    Optional[str] = None,
     plot_dir:    Optional[str] = None,
     num_samples: int = config.INCREMENTAL_NUM_SAMPLES,
+    ligand_keys: Optional[List[str]] = None,
 ) -> Dict[str, dict]:
     """
     Main Stage-2 function.
+
+    ligand_keys : optional list of ligand-key strings ("{resname}-{chain}-
+        {resseq}") to restrict processing to. When None (default) every
+        matched ligand is processed (original behaviour).
 
     Returns
     -------
@@ -411,6 +578,13 @@ def run_generation(
         print("     Did you run stage1_5_random_masking.py?")
     if unmatched_s15:
         print(f"\n  ⚠️  Stage-1.5 ligands with NO Stage-1 match (ignored): {unmatched_s15}")
+
+    if ligand_keys is not None:
+        wanted  = set(ligand_keys)
+        unknown = sorted(wanted - set(matched))
+        if unknown:
+            print(f"\n  ⚠️  Requested ligand(s) not in matched set (ignored): {unknown}")
+        matched = [k for k in matched if k in wanted]
 
     if not matched:
         print("\n  ❌ No matched ligands found.  Exiting.")
@@ -511,7 +685,7 @@ def _run_test():
             print(f"  ❌ FAIL  {msg}")
             failed += 1
 
-    # ── Wipe and recreate TEST_DIR sub-folders (Option A) ────────────────────
+    # ── Wipe and recreate config.TEST_DIR sub-folders (Option A) ────────────────────
     s1_dir   = os.path.join(config.TEST_DIR, "stage1")
     s15_dir  = os.path.join(config.TEST_DIR, "stage15")
     pred_dir = os.path.join(config.TEST_DIR, "preds")
@@ -519,11 +693,11 @@ def _run_test():
 
     if os.path.exists(config.TEST_DIR):
         shutil.rmtree(config.TEST_DIR)
-        print(f"  🗑  Wiped existing TEST_DIR: {config.TEST_DIR}")
+        print(f"  🗑  Wiped existing config.TEST_DIR: {config.TEST_DIR}")
 
     for d in [s1_dir, s15_dir, pred_dir, plot_dir]:
         os.makedirs(d)
-    print(f"  📁 Created fresh TEST_DIR:  {config.TEST_DIR}\n")
+    print(f"  📁 Created fresh config.TEST_DIR:  {config.TEST_DIR}\n")
 
     for lig in test_ligands:
         key = (f"{lig['ligand']['resname']}-"
@@ -588,21 +762,113 @@ def _run_test():
 #  ENTRY POINT
 # ════════════════════════════════════════════════════════════════════════════
 
+def _ask_yes_no(question: str) -> bool:
+    """
+    Print question and loop until the user types 'yes' or 'no' (case-insensitive).
+    No default — an empty Enter is rejected and the prompt repeats.
+    Returns True for yes, False for no.
+    """
+    while True:
+        answer = input(f"{question} (yes/no): ").strip().lower()
+        if answer in ("yes", "y"):
+            return True
+        if answer in ("no", "n"):
+            return False
+        print("  Please type 'yes' or 'no'.")
+
+
+def _select_ligands(matched: List[str]) -> List[str]:
+    """
+    Prompt the user to choose which matched ligand(s) to process: all of them,
+    or a comma-separated subset selected by number.
+
+    Re-prompts until a valid choice is entered. Returns the selected ligand-key
+    strings in menu order (duplicates removed).
+    """
+    print("\n  Matched ligands (present in both Stage-1 and Stage-1.5):")
+    for i, key in enumerate(matched, start=1):
+        print(f"    {i:>2d} : {key}")
+    print("    all : run every ligand listed above  [default]")
+
+    while True:
+        raw = input(
+            "\n  Select ligand(s) — comma-separated numbers (e.g. 1,3) "
+            "or 'all' [all]: "
+        ).strip().lower()
+
+        if raw in ("", "all"):
+            print(f"\n  ✅ Selected: ALL {len(matched)} ligand(s).")
+            return matched
+
+        tokens = [t.strip() for t in raw.split(",") if t.strip()]
+        try:
+            picks = [int(t) for t in tokens]
+        except ValueError:
+            print("    Please enter numbers separated by commas, or 'all'.")
+            continue
+
+        if not picks:
+            print("    Please enter at least one number, or 'all'.")
+            continue
+
+        if any(p < 1 or p > len(matched) for p in picks):
+            print(f"    Numbers must be between 1 and {len(matched)}.")
+            continue
+
+        seen: set = set()
+        selected: List[str] = []
+        for i, key in enumerate(matched, start=1):
+            if i in picks and i not in seen:
+                seen.add(i)
+                selected.append(key)
+
+        print(f"\n  ✅ Selected {len(selected)} ligand(s): {', '.join(selected)}")
+        return selected
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Stage 2: Incremental Molecule Generation")
-    parser.add_argument("--test", action="store_true",
-                        help="Run self-contained smoke test (no PDB/PLIP files needed).")
-    args = parser.parse_args()
-
-    if args.test:
-        ok = _run_test()
-        sys.exit(0 if ok else 1)
-
     print("\n" + "=" * 60)
     print("STAGE 2: INCREMENTAL MOLECULE GENERATION")
     print("=" * 60)
 
-    results = run_generation()
+    print("""
+  Before running the full pipeline (which requires Stage-1 and Stage-1.5
+  JSON files and calls ChemBERTa for every ligand × mask count), you can
+  run a smoke test instead.
+
+  The smoke test:
+    • Does NOT need any PDB or PLIP files.
+    • Creates two synthetic ligands (aspirin and caffeine) with hard-coded
+      interaction-aware and random atom indices.
+    • Runs ChemBERTa with only 5 samples per cell (~2 min on CPU).
+    • Checks that all expected output files and plots are produced.
+    • Saves everything to:
+        {test_dir}
+      (this directory is wiped clean at the start of every test run).
+    • Prints PASS / FAIL for each assertion so you can verify the
+      pipeline wiring before committing to a full run.
+""".format(test_dir=config.TEST_DIR))
+
+    run_test = _ask_yes_no("  Run the smoke test?")
+
+    if run_test:
+        ok = _run_test()
+        sys.exit(0 if ok else 1)
+
+    print("\n" + "=" * 60)
+    print("Running full incremental generation pipeline ...")
+    print("=" * 60)
+
+    # Let the user pick which matched ligand(s) to run.
+    stage1_metas  = load_json_folder(config.MASK_CALC_OUTDIR)
+    stage15_metas = load_json_folder(config.RANDOM_MASK_OUTDIR)
+    matched       = sorted(set(stage1_metas) & set(stage15_metas))
+
+    if not matched:
+        results = run_generation()   # prints standard diagnostics and exits
+    else:
+        selected = _select_ligands(matched)
+        results  = run_generation(ligand_keys=selected)
 
     print("\n" + "=" * 60)
     print("✅ Stage 2 complete.")

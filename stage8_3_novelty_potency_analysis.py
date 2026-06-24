@@ -142,6 +142,80 @@ def _resolve_csv_path() -> str:
     return _ask_csv_path()
 
 
+def _ask_ligand_selection(csv_path: str) -> Optional[List[str]]:
+    """
+    Read available ligand groups from the docking CSV and let the user
+    select a subset. Returns a list of selected group names, or None if
+    the user chose all groups (press Enter).
+
+    Example — CSV has: EAM-A-1, 1GH-A-1173, 62G-A-201
+      [1] 1GH-A-1173
+      [2] 62G-A-201
+      [3] EAM-A-1
+      Select (e.g. 1,3  or  Enter for all): 1,3
+      → returns ["1GH-A-1173", "EAM-A-1"]
+    """
+    try:
+        df_tmp = pd.read_csv(csv_path, usecols=["ligand_group"])
+        groups = sorted(df_tmp["ligand_group"].dropna().unique().tolist())
+    except Exception as e:
+        print(f"  ⚠️  Could not read ligand groups from CSV: {e}")
+        return None
+
+    if not groups:
+        print("  ⚠️  No ligand groups found in CSV.")
+        return None
+
+    print("\n  Available ligand groups in docking CSV:")
+    for i, g in enumerate(groups, start=1):
+        print(f"    [{i}] {g}")
+
+    while True:
+        raw = input(
+            "  Select groups (comma-separated numbers, e.g. 1,3)"
+            "  or press Enter to use ALL: "
+        ).strip()
+
+        if raw == "":
+            print(f"  ✅ Using all {len(groups)} ligand group(s).")
+            return None   # None = all groups
+
+        parts = [p.strip() for p in raw.split(",")]
+        selected, invalid = [], []
+        for p in parts:
+            if p.isdigit() and 1 <= int(p) <= len(groups):
+                g = groups[int(p) - 1]
+                if g not in selected:
+                    selected.append(g)
+            else:
+                invalid.append(p)
+
+        if invalid:
+            print(f"    ❌ Invalid selection(s): {invalid}. "
+                  f"Enter numbers between 1 and {len(groups)}, "
+                  f"comma-separated.")
+            continue
+
+        print(f"  ✅ Selected {len(selected)} group(s): {', '.join(selected)}")
+        return selected
+
+
+def _ask_top_n() -> int:
+    """Ask how many top molecules to select per ranking method (default 10)."""
+    print("""
+  How many top molecules to select and draw per ranking method?
+  This controls both the PDF report and the individual PNG images.
+  Default: 10
+""")
+    while True:
+        raw = input("  Top-N molecules [10]: ").strip()
+        if raw == "":
+            return 10
+        if raw.isdigit() and int(raw) >= 1:
+            return int(raw)
+        print("    Please enter a positive integer (e.g. 5, 10, 20).")
+
+
 def _ask_y_score() -> str:
     """Ask which score to use on the Y axis."""
     print("""
@@ -790,11 +864,44 @@ def _mol_png_bytes(smi: str, w: int = 200, h: int = 160) -> Optional[bytes]:
     return buf.getvalue()
 
 
+def save_mol_pngs(
+    top_df:    pd.DataFrame,
+    folder:    str,
+    top_n:     int = 10,
+    img_w:     int = 400,
+    img_h:     int = 320,
+) -> List[str]:
+    """
+    Save one PNG per molecule in top_df to folder.
+
+    Filename: rank_{N:02d}_{safe_smiles_prefix}.png
+    Returns list of saved PNG paths.
+    """
+    os.makedirs(folder, exist_ok=True)
+    saved = []
+    df = top_df.head(top_n).reset_index(drop=True)
+    for rank_i, (_, row) in enumerate(df.iterrows(), start=1):
+        smi = str(row["smiles"])
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            print(f"    ⚠️  Rank {rank_i}: invalid SMILES, PNG skipped.")
+            continue
+        img  = Draw.MolToImage(mol, size=(img_w, img_h))
+        stem = _safe(smi[:40])          # first 40 chars, filesystem-safe
+        fname = f"rank_{rank_i:02d}_{stem}.png"
+        fpath = os.path.join(folder, fname)
+        img.save(fpath)
+        saved.append(fpath)
+    print(f"  🖼  {len(saved)} molecule PNG(s) saved to: {os.path.basename(folder)}/")
+    return saved
+
+
 def build_top10_pdf(
     pareto_df:    pd.DataFrame,
     out_path:     str,
     title_note:   str = "",
     method_label: str = "Pareto Front",
+    top_n:        int = 10,
 ) -> None:
     """
     Build a PDF report of top-10 molecules, one row per molecule with
@@ -816,11 +923,11 @@ def build_top10_pdf(
 
     top10 = (pareto_df
              .sort_values("composite", ascending=False)
-             .head(10)
+             .head(top_n)
              .reset_index(drop=True))
 
     if len(top10) == 0:
-        print("  ⚠️  No Pareto-front molecules to write to PDF.")
+        print("  ⚠️  No molecules to write to PDF.")
         return
 
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
@@ -850,7 +957,7 @@ def build_top10_pdf(
 
     story = []
     story.append(Paragraph(
-        f"Top-10 Novel Potent Molecules — {method_label}", title_style))
+        f"Top-{top_n} Novel Potent Molecules — {method_label}", title_style))
     story.append(Paragraph(
         f"Ranked by composite score (CNNaffinity × CNNscore)  ·  "
         f"Pareto front size: {len(pareto_df)}  ·  {title_note}",
@@ -945,33 +1052,37 @@ def _safe(s: str) -> str:
 
 
 def run_stage8(
-    csv_path:         Optional[str]   = None,
-    mask_calc_dir:    Optional[str]   = None,
-    stage8_dir:       Optional[str]   = None,
-    y_col:            str             = "CNNaffinity",
-    cnn_score_min:    float           = 0.70,
-    vinardo_max:      float           = -7.0,
-    ranking_methods:  Optional[set]   = None,
-    tanimoto_cutoff:  float           = 0.40,
-    mmr_lambda:       float           = 0.50,
-    cluster_cutoff:   float           = 0.40,
-    show_pareto:      bool            = False,
+    csv_path:         Optional[str]        = None,
+    mask_calc_dir:    Optional[str]        = None,
+    stage8_dir:       Optional[str]        = None,
+    y_col:            str                  = "CNNaffinity",
+    cnn_score_min:    float                = 0.70,
+    vinardo_max:      float                = -7.0,
+    ranking_methods:  Optional[set]        = None,
+    tanimoto_cutoff:  float                = 0.40,
+    mmr_lambda:       float                = 0.50,
+    cluster_cutoff:   float                = 0.40,
+    show_pareto:      bool                 = False,
+    selected_groups:  Optional[List[str]]  = None,
+    top_n:            int                  = 10,
 ) -> Dict[str, object]:
     """
     Run Stage-8 analysis.
 
     Parameters
     ----------
-    ranking_methods : set of method keys — any subset of
-                      {"idea1", "idea3", "idea4", "idea5"}.
-                      Default: {"idea1"}.
-    tanimoto_cutoff : Tanimoto novelty cutoff for Idea 1 (default 0.40).
-    mmr_lambda      : λ for MMR Idea 4 (default 0.50).
-    cluster_cutoff  : Butina cutoff for Idea 5 (default 0.40).
-    show_pareto     : overlay Pareto-front on scatter plots (default False).
+    ranking_methods  : set of method keys — any subset of
+                       {"idea1", "idea3", "idea4", "idea5"}.
+                       Default: {"idea1"}.
+    tanimoto_cutoff  : Tanimoto novelty cutoff for Idea 1 (default 0.40).
+    mmr_lambda       : λ for MMR Idea 4 (default 0.50).
+    cluster_cutoff   : Butina cutoff for Idea 5 (default 0.40).
+    show_pareto      : overlay Pareto-front on scatter plots (default False).
+    selected_groups  : list of ligand_group names to analyse. If None, all
+                       groups in the CSV are used.
 
     Returns dict with keys:
-      df               : full annotated DataFrame
+      df               : full annotated DataFrame (selected groups only)
       pareto_df        : Pareto-front subset
       filtered_df      : hierarchical-filter subset
       scatter_paths    : list of PNG paths written
@@ -990,6 +1101,21 @@ def run_stage8(
 
     df = load_docking_data(csv_path, original_smiles_map)
     print(f"  Docked molecules (pose-1): {len(df)}")
+
+    # ── Filter to selected ligand groups ──────────────────────────────────────
+    if selected_groups is not None:
+        available = set(df["ligand_group"].unique())
+        missing   = [g for g in selected_groups if g not in available]
+        if missing:
+            print(f"  ⚠️  Groups not found in CSV (ignored): {missing}")
+        valid = [g for g in selected_groups if g in available]
+        if not valid:
+            print("  ❌ No valid groups after filtering. Exiting.")
+            return {}
+        df = df[df["ligand_group"].isin(valid)].copy().reset_index(drop=True)
+        print(f"  Groups selected: {valid}")
+        print(f"  Molecules after group filter: {len(df)}")
+
     print(f"  Molecules with Tanimoto computed: "
           f"{df['tanimoto'].notna().sum()}")
 
@@ -1028,37 +1154,46 @@ def run_stage8(
         "idea1": {
             "label": f"Idea 1 — Tanimoto < {tanimoto_cutoff}, ranked by composite",
             "fn":    lambda: top10_idea1(df, tanimoto_cutoff, cnn_score_min, vinardo_max),
-            "fname": "top10_idea1_tanimoto_cutoff.pdf",
+            "fname": f"top{top_n}_idea1_tanimoto_cutoff.pdf",
+            "stem":  f"top{top_n}_idea1_tanimoto_cutoff",
         },
         "idea3": {
             "label": (f"Idea 3 — Hierarchical filter (CNNscore>{cnn_score_min},"
                       f" Vinardo<{vinardo_max}) → Pareto"),
             "fn":    lambda: top10_idea3(df, pareto_df, cnn_score_min, vinardo_max),
-            "fname": "top10_idea3_filter_pareto.pdf",
+            "fname": f"top{top_n}_idea3_filter_pareto.pdf",
+            "stem":  f"top{top_n}_idea3_filter_pareto",
         },
         "idea4": {
             "label": f"Idea 4 — MMR (λ={mmr_lambda})",
             "fn":    lambda: top10_idea4_mmr(df, mmr_lambda),
-            "fname": f"top10_idea4_mmr_lambda{mmr_lambda}.pdf",
+            "fname": f"top{top_n}_idea4_mmr_lambda{mmr_lambda}.pdf",
+            "stem":  f"top{top_n}_idea4_mmr_lambda{mmr_lambda}",
         },
         "idea5": {
             "label": f"Idea 5 — Butina cluster-pick (cutoff={cluster_cutoff})",
             "fn":    lambda: top10_idea5_cluster(df, cluster_cutoff),
-            "fname": f"top10_idea5_cluster_cutoff{cluster_cutoff}.pdf",
+            "fname": f"top{top_n}_idea5_cluster_cutoff{cluster_cutoff}.pdf",
+            "stem":  f"top{top_n}_idea5_cluster_cutoff{cluster_cutoff}",
         },
     }
 
     for method_key in sorted(ranking_methods):
         cfg      = method_configs[method_key]
-        top10_df = cfg["fn"]()
-        if top10_df.empty:
+        topn_df  = cfg["fn"]()
+        if topn_df.empty:
             print(f"  ⚠️  {method_key}: no molecules selected, PDF skipped.")
             continue
         pdf_path = os.path.join(stage8_dir, cfg["fname"])
-        build_top10_pdf(top10_df, pdf_path,
+        build_top10_pdf(topn_df, pdf_path,
                         title_note=csv_note,
-                        method_label=cfg["label"])
+                        method_label=cfg["label"],
+                        top_n=top_n)
         pdf_paths[method_key] = pdf_path
+
+        # ── Per-molecule PNGs — saved in folder named after the PDF stem ──────
+        png_folder = os.path.join(stage8_dir, cfg["stem"])
+        save_mol_pngs(topn_df, png_folder, top_n=top_n)
 
     # ── Hierarchical filter summary CSV ──────────────────────────────────────
     filt_csv = os.path.join(stage8_dir, "hierarchical_filter_results.csv")
@@ -1229,11 +1364,17 @@ def main():
     # ── CSV path ──────────────────────────────────────────────────────────────
     csv_path = _resolve_csv_path()
 
+    # ── Ligand group selection ────────────────────────────────────────────────
+    selected_groups = _ask_ligand_selection(csv_path)
+
     # ── Y axis ────────────────────────────────────────────────────────────────
     y_col = _ask_y_score()
 
     # ── Pareto overlay on scatter ─────────────────────────────────────────────
     show_pareto = _ask_show_pareto()
+
+    # ── Top-N molecules per method ────────────────────────────────────────────
+    top_n = _ask_top_n()
 
     # ── Ranking methods ───────────────────────────────────────────────────────
     methods = _ask_ranking_methods()
@@ -1272,6 +1413,8 @@ def main():
         mmr_lambda      = mmr_lambda,
         cluster_cutoff  = cluster_cutoff,
         show_pareto     = show_pareto,
+        selected_groups = selected_groups,
+        top_n           = top_n,
     )
 
     print("\n" + "=" * 60)

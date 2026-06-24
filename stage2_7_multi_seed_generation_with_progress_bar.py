@@ -84,7 +84,15 @@ import shutil
 import sys
 from typing import Dict, List, Optional, Set, Tuple
 
+try:
+    from tqdm import tqdm
+except ImportError:  # graceful fallback — bar becomes a no-op
+    def tqdm(iterable, **kwargs):  # type: ignore
+        return iterable
+
 import config
+from rdkit import RDLogger as _RDLogger
+_RDLogger.DisableLog("rdApp.*")   # suppress RDKit 2D/3D and noise warnings
 from stage2_molecule_generation import (
     generate_smiles_sequential,
     load_chemberta,
@@ -256,8 +264,21 @@ def run_multi_seed_for_ligand(
     ia_valids:   List[int] = []
     rand_valids: List[int] = []
 
+    # Total steps = N mask_counts × len(seeds)
+    total_steps = N * len(seeds)
+    pbar = tqdm(
+        total     = total_steps,
+        desc      = f"{lig_id}",
+        unit      = "step",
+        dynamic_ncols = True,
+        bar_format = (
+            "{l_bar}{bar}| {n_fmt}/{total_fmt} steps "
+            "[{elapsed}<{remaining}, {rate_fmt}] {postfix}"
+        ),
+    )
+
     for mask_count in range(1, N + 1):
-        print(f"\n    ── mask_count = {mask_count}/{N} ──")
+        tqdm.write(f"\n    ── mask_count = {mask_count}/{N} ──")
 
         # Aggregate across all seeds
         ia_pool:   Set[str] = set()
@@ -265,6 +286,12 @@ def run_multi_seed_for_ligand(
 
         for seed in seeds:
             step_seed = seed + mask_count
+
+            # Update bar label before the (potentially slow) generation call
+            pbar.set_postfix_str(
+                f"mask={mask_count}/{N}  seed={seed}  …",
+                refresh=True,
+            )
 
             # ── Try reuse first ───────────────────────────────────────────────
             ia_cached, rand_cached, source = _find_cached_predictions(
@@ -279,11 +306,16 @@ def run_multi_seed_for_ligand(
             if source != "new":
                 ia_pool.update(ia_cached   or [])
                 rand_pool.update(rand_cached or [])
-                print(
+                tqdm.write(
                     f"      seed={seed:>4d}  step_seed={step_seed}  "
                     f"♻️  reused from {source}  "
                     f"(+{len(ia_cached or [])} IA, +{len(rand_cached or [])} rand)"
                 )
+                pbar.set_postfix_str(
+                    f"mask={mask_count}/{N}  seed={seed}  ♻️ cached",
+                    refresh=True,
+                )
+                pbar.update(1)
                 continue
 
             # ── Sample indices ────────────────────────────────────────────────
@@ -292,14 +324,17 @@ def run_multi_seed_for_ligand(
             rng         = random.Random(step_seed)
             rand_picked = rng.sample(rand_indices, mask_count)
 
-            print(
+            tqdm.write(
                 f"      seed={seed:>4d}  step_seed={step_seed}  "
                 f"IA picked={sorted(ia_picked)}  "
-                f"rand picked={sorted(rand_picked)}",
-                end="  ", flush=True,
+                f"rand picked={sorted(rand_picked)}"
             )
 
             # ── Generate IA predictions ───────────────────────────────────────
+            pbar.set_postfix_str(
+                f"mask={mask_count}/{N}  seed={seed}  generating IA …",
+                refresh=True,
+            )
             ia_masked  = mask_atoms_in_smiles(smiles, ia_picked, tokenizer)
             cache_ia   = _seed_cache_path(stage27_pred_dir, lig_id, seed,
                                           mask_count, "ia")
@@ -313,6 +348,10 @@ def run_multi_seed_for_ligand(
             )
 
             # ── Generate random predictions ───────────────────────────────────
+            pbar.set_postfix_str(
+                f"mask={mask_count}/{N}  seed={seed}  generating rand …",
+                refresh=True,
+            )
             rand_masked = mask_atoms_in_smiles(smiles, rand_picked, tokenizer)
             cache_rand  = _seed_cache_path(stage27_pred_dir, lig_id, seed,
                                            mask_count, "rand")
@@ -327,7 +366,12 @@ def run_multi_seed_for_ligand(
 
             ia_pool.update(ia_preds)
             rand_pool.update(rand_preds)
-            print(f"new  (+{len(ia_preds)} IA, +{len(rand_preds)} rand)")
+            tqdm.write(f"      → new  (+{len(ia_preds)} IA, +{len(rand_preds)} rand)")
+            pbar.set_postfix_str(
+                f"mask={mask_count}/{N}  seed={seed}  ✓ new",
+                refresh=True,
+            )
+            pbar.update(1)
 
         # ── Write aggregated output for this mask_count ───────────────────────
         agg_ia_path   = os.path.join(lig_out_dir, f"ia_mask{mask_count:03d}.txt")
@@ -335,7 +379,7 @@ def run_multi_seed_for_ligand(
         _write_smiles_file(agg_ia_path,   sorted(ia_pool))
         _write_smiles_file(agg_rand_path, sorted(rand_pool))
 
-        print(
+        tqdm.write(
             f"      → Aggregated: {len(ia_pool)} unique IA, "
             f"{len(rand_pool)} unique rand"
         )
@@ -343,6 +387,8 @@ def run_multi_seed_for_ligand(
         mask_counts.append(mask_count)
         ia_valids.append(len(ia_pool))
         rand_valids.append(len(rand_pool))
+
+    pbar.close()
 
     return mask_counts, ia_valids, rand_valids
 
@@ -359,9 +405,14 @@ def run_stage27(
     stage25_pred_dir:  Optional[str]   = None,
     seeds:             Optional[List[int]] = None,
     num_samples:       int = config.INCREMENTAL_NUM_SAMPLES,
+    ligand_keys:       Optional[List[str]] = None,
 ) -> Dict[str, dict]:
     """
     Run Stage 2.7 for all matched ligands.
+
+    ligand_keys : optional list of ligand-key strings ("{resname}-{chain}-
+        {resseq}") to restrict processing to. When None (default) every
+        matched ligand is processed (original behaviour).
 
     Returns
     -------
@@ -406,6 +457,13 @@ def run_stage27(
         print(f"\n  ⚠️  Stage-1 ligands with NO Stage-1.5 match (skipped): {unmatched_s1}")
     if unmatched_s15:
         print(f"\n  ⚠️  Stage-1.5 ligands with NO Stage-1 match (ignored): {unmatched_s15}")
+
+    if ligand_keys is not None:
+        wanted  = set(ligand_keys)
+        unknown = sorted(wanted - set(matched))
+        if unknown:
+            print(f"\n  ⚠️  Requested ligand(s) not in matched set (ignored): {unknown}")
+        matched = [k for k in matched if k in wanted]
 
     if not matched:
         print("\n  ❌ No matched ligands found.  Exiting.")
@@ -610,6 +668,55 @@ def _run_test() -> bool:
 #  ENTRY POINT
 # ════════════════════════════════════════════════════════════════════════════
 
+def _select_ligands(matched: List[str]) -> List[str]:
+    """
+    Prompt the user to choose which matched ligand(s) to process: all of them,
+    or a comma-separated subset selected by number.
+
+    Re-prompts until a valid choice is entered. Returns the selected ligand-key
+    strings in menu order (duplicates removed).
+    """
+    print("\n  Matched ligands (present in both Stage-1 and Stage-1.5):")
+    for i, key in enumerate(matched, start=1):
+        print(f"    {i:>2d} : {key}")
+    print("    all : run every ligand listed above  [default]")
+
+    while True:
+        raw = input(
+            "\n  Select ligand(s) — comma-separated numbers (e.g. 1,3) "
+            "or 'all' [all]: "
+        ).strip().lower()
+
+        if raw in ("", "all"):
+            print(f"\n  ✅ Selected: ALL {len(matched)} ligand(s).")
+            return matched
+
+        tokens = [t.strip() for t in raw.split(",") if t.strip()]
+        try:
+            picks = [int(t) for t in tokens]
+        except ValueError:
+            print("    Please enter numbers separated by commas, or 'all'.")
+            continue
+
+        if not picks:
+            print("    Please enter at least one number, or 'all'.")
+            continue
+
+        if any(p < 1 or p > len(matched) for p in picks):
+            print(f"    Numbers must be between 1 and {len(matched)}.")
+            continue
+
+        seen: Set[int] = set()
+        selected: List[str] = []
+        for i, key in enumerate(matched, start=1):
+            if i in picks and i not in seen:
+                seen.add(i)
+                selected.append(key)
+
+        print(f"\n  ✅ Selected {len(selected)} ligand(s): {', '.join(selected)}")
+        return selected
+
+
 def main():
     print("\n" + "=" * 60)
     print("STAGE 2.7: MULTI-SEED RANDOM-PICK GENERATION")
@@ -652,7 +759,16 @@ def main():
         print("  Exiting.")
         sys.exit(0)
 
-    results = run_stage27()
+    # Let the user pick which matched ligand(s) to run.
+    stage1_metas  = load_json_folder(config.MASK_CALC_OUTDIR)
+    stage15_metas = load_json_folder(config.RANDOM_MASK_OUTDIR)
+    matched       = sorted(set(stage1_metas) & set(stage15_metas))
+
+    if not matched:
+        results = run_stage27()   # prints standard diagnostics and exits
+    else:
+        selected = _select_ligands(matched)
+        results  = run_stage27(ligand_keys=selected)
 
     print("\n" + "=" * 60)
     print("✅ Stage 2.7 complete.")

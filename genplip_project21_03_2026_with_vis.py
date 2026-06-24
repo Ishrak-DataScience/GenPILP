@@ -1279,6 +1279,115 @@ def load_chemberta(model_name: str = CHEMBERTA_MODEL):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  RDKIT LOGIT FILTERING — helpers
+# ════════════════════════════════════════════════════════════════════════════
+
+import re as _re
+
+# Regex matching any token that can appear in a valid SMILES string.
+# Covers: multi-char elements, single-char atoms, aromatic atoms, bond
+# symbols, branches, ring closures, bracket atoms, charge marks.
+_SMILES_TOKEN_RE = _re.compile(
+    r"^(?:"
+    r"Br|Cl|Si|Se|As|Te|Na|Li|Ca|Mg|Fe|Zn|Cu|Mn|Co|Ni|Pd|Pt|Al|Sn|Bi|Hg|Cr|"
+    r"[BCNOFPSIbcnops]|"          # single-char aliphatic / aromatic atoms
+    r"[=:#.\/\\]|"                  # bond symbols
+    r"[\(\)]|"                      # branch open/close
+    r"[1-9]|%[1-9][0-9]|"          # ring-closure digits
+    r"\[(?:[^\[\]])*\]|"            # bracket atoms  e.g. [NH2+]
+    r"[+\-]"                        # explicit charge tokens
+    r")$"
+)
+
+# Per-tokenizer cache: tokenizer id → CPU bool tensor (vocab_size,)
+_SMILES_VOCAB_MASK_CACHE: dict = {}
+
+
+def _build_smiles_vocab_mask(tokenizer) -> "torch.Tensor":
+    """
+    Return a boolean CPU tensor of shape (vocab_size,) where True marks
+    tokens that are legal SMILES fragments.  Built once per tokenizer and
+    cached for the lifetime of the process.
+    """
+    key = id(tokenizer)
+    if key in _SMILES_VOCAB_MASK_CACHE:
+        return _SMILES_VOCAB_MASK_CACHE[key]
+
+    vocab_size = tokenizer.vocab_size or len(tokenizer.get_vocab())
+    mask = torch.zeros(vocab_size, dtype=torch.bool)
+
+    # Always allow all special tokens (MASK, PAD, CLS, SEP, UNK, EOS, BOS)
+    special_ids = {
+        tokenizer.cls_token_id, tokenizer.sep_token_id,
+        tokenizer.pad_token_id, tokenizer.unk_token_id,
+        tokenizer.mask_token_id,
+        getattr(tokenizer, "eos_token_id", None),
+        getattr(tokenizer, "bos_token_id", None),
+    } - {None}
+    for sid in special_ids:
+        if 0 <= sid < vocab_size:
+            mask[sid] = True
+
+    for token, idx in tokenizer.get_vocab().items():
+        if idx >= vocab_size:
+            continue
+        t = token.strip()
+        if t and _SMILES_TOKEN_RE.match(t):
+            mask[idx] = True
+
+    _SMILES_VOCAB_MASK_CACHE[key] = mask
+    return mask
+
+
+def _partial_smiles_valid(ids: "torch.Tensor", tokenizer) -> bool:
+    """
+    Lightweight structural check on a partially-filled token sequence.
+    Decodes the current ids to a string and verifies:
+      • Parenthesis depth never goes negative (no premature close)
+      • Bracket depth never goes negative
+      • Each ring-closure digit appears at most twice
+
+    Does NOT call RDKit — fast enough to run once per candidate per position.
+    Returns True when the partial string is still structurally consistent.
+    """
+    try:
+        partial = tokenizer.decode(ids, skip_special_tokens=True).replace(" ", "")
+    except Exception:
+        return True  # decoding failed — don't penalise
+
+    paren_depth   = 0
+    bracket_depth = 0
+    ring_counts: dict = {}
+    i = 0
+    while i < len(partial):
+        c = partial[i]
+        if c == "(":
+            paren_depth += 1
+        elif c == ")":
+            paren_depth -= 1
+            if paren_depth < 0:
+                return False
+        elif c == "[":
+            bracket_depth += 1
+        elif c == "]":
+            bracket_depth -= 1
+            if bracket_depth < 0:
+                return False
+        elif c == "%" and i + 2 < len(partial) and partial[i + 1: i + 3].isdigit():
+            rnum = partial[i: i + 3]
+            ring_counts[rnum] = ring_counts.get(rnum, 0) + 1
+            if ring_counts[rnum] > 2:
+                return False
+            i += 2  # skip the two digit chars
+        elif c.isdigit() and bracket_depth == 0:
+            ring_counts[c] = ring_counts.get(c, 0) + 1
+            if ring_counts[c] > 2:
+                return False
+        i += 1
+    return True
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  SEQUENTIAL ChemBERTa GENERATION
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -1292,12 +1401,31 @@ def generate_smiles_sequential(
     num_samples: int = INCREMENTAL_NUM_SAMPLES,
     temperature: float = TEMPERATURE,
     save_path: Optional[str] = None,
+    rdkit_logit_filter: bool = True,
 ) -> List[str]:
     """
     Sequentially fill all <mask> tokens in smiles_masked left-to-right.
     Each fill is conditioned on all previously filled tokens.
 
-    Returns a sorted list of unique valid SMILES.
+    RDKit logit filtering (rdkit_logit_filter=True, default):
+      At every mask position two filtering passes are applied before sampling:
+
+      Pass 1 — Vocabulary whitelist:
+        Logits for tokens that are not valid SMILES fragments (according to
+        _SMILES_TOKEN_RE) are set to -inf.  This eliminates word-piece tokens
+        like "##ing" or "protein" that ChemBERTa would otherwise sample.
+
+      Pass 2 — Structural consistency check:
+        For each candidate in the surviving top-k, the partial decoded string
+        is tested with _partial_smiles_valid().  Tokens that would create an
+        unbalanced parenthesis, bracket, or a ring-closure digit appearing more
+        than twice are masked out.  If ALL candidates fail this check the pass
+        is skipped (fall-back to Pass-1 result) to avoid dead-ends.
+
+    Both passes are zero-cost in terms of extra model forward passes — they
+    operate only on the logit tensor already produced by the model.
+
+    Returns a sorted list of unique RDKit-valid SMILES.
     Optionally saves them to save_path (one per line).
     """
     max_len = getattr(tokenizer, "model_max_length", 512)
@@ -1313,25 +1441,58 @@ def generate_smiles_sequential(
 
     mask_positions = (base_ids == mask_id).nonzero(as_tuple=True)[0].tolist()
     if not mask_positions:
-        # Input has no masks — just validate the literal string
         clean = smiles_masked.replace(" ", "")
         if Chem.MolFromSmiles(clean) is not None:
             return [clean]
         return []
+
+    # Build vocab mask once (cached after first call for this tokenizer)
+    if rdkit_logit_filter:
+        vocab_mask = _build_smiles_vocab_mask(tokenizer).to(device)
 
     valid_set: set = set()
     invalid   = 0
 
     for _ in range(num_samples):
         ids = base_ids.clone()
+
         for pos in mask_positions:
-            out     = model(input_ids=ids.unsqueeze(0), attention_mask=base_attn.unsqueeze(0))
-            logits  = out.logits[0, pos] / max(temperature, 1e-8)
-            probs   = torch.softmax(logits, dim=-1)
-            topk    = torch.topk(probs, k=top_k)
-            top_p   = topk.values / topk.values.sum()
-            sampled = torch.multinomial(top_p, num_samples=1).item()
-            ids[pos] = topk.indices[sampled]
+            out    = model(input_ids=ids.unsqueeze(0),
+                           attention_mask=base_attn.unsqueeze(0))
+            logits = out.logits[0, pos] / max(temperature, 1e-8)
+
+            if rdkit_logit_filter:
+                # ── Pass 1: zero non-SMILES tokens ──────────────────────────
+                logits = logits.masked_fill(~vocab_mask, float("-inf"))
+
+                # ── Pass 2: structural consistency filter ────────────────────
+                k = min(top_k, int(vocab_mask.sum().item()), logits.shape[0])
+                k = max(k, 1)
+                topk = torch.topk(logits, k=k)
+
+                struct_ok = torch.ones(k, dtype=torch.bool, device=device)
+                for ci in range(k):
+                    test_ids = ids.clone()
+                    test_ids[pos] = topk.indices[ci]
+                    if not _partial_smiles_valid(test_ids, tokenizer):
+                        struct_ok[ci] = False
+
+                # Fall back to Pass-1 result if every candidate fails Pass 2
+                if not struct_ok.any():
+                    struct_ok = torch.ones(k, dtype=torch.bool, device=device)
+
+                filtered_logits = topk.values.masked_fill(~struct_ok, float("-inf"))
+                top_p  = torch.softmax(filtered_logits, dim=-1)
+                chosen = torch.multinomial(top_p, num_samples=1).item()
+                ids[pos] = topk.indices[chosen]
+
+            else:
+                # Original unfiltered sampling
+                probs   = torch.softmax(logits, dim=-1)
+                topk    = torch.topk(probs, k=top_k)
+                top_p   = topk.values / topk.values.sum()
+                chosen  = torch.multinomial(top_p, num_samples=1).item()
+                ids[pos] = topk.indices[chosen]
 
         cand = tokenizer.decode(ids, skip_special_tokens=True).replace(" ", "")
         if Chem.MolFromSmiles(cand) is not None:

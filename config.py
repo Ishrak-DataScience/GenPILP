@@ -8,7 +8,7 @@ py  ─  Shareduration for all pipeline stages.
 # ── Root directory ─────────────────────────────────────────────────────────────
 BASE_DIR    = "/content/drive/MyDrive/GenAI4Drug"
 USER_PREFIX = "Ishrak"
-EXPERIMENT_TAG = "expo05"
+EXPERIMENT_TAG = "expo09_fixed_BPE_tokenization"
 
 # ── All outputs live under BASE_DIR / USER_PREFIX / Output / <subdir> ────────── old
 #_OUT = f"{BASE_DIR}/{USER_PREFIX}/Output"
@@ -24,6 +24,7 @@ REF_CSV_PATH  = f"{BASE_DIR}/Dummy_data/BR4_PDB_Data.csv"
 # ── Output directories ─────────────────────────────────────────────────────────
 MASK_CALC_OUTDIR   = f"{_OUT}/PLIP_Mask_Calculation/"    # Stage 1   → JSON files
 RANDOM_MASK_OUTDIR = f"{_OUT}/Random_Mask_Calculation/"  # Stage 1.5 → JSON files
+CHEMBL_MASK_OUTDIR = f"{_OUT}/ChEMBL_Mask_Calculation/"  # Stage 1.7 → ChEMBL random-mask JSONs
 DEBUG_DIR          = f"{_OUT}/masked_smiles_lists/"       # per-ligand debug txt
 PRED_DIR           = f"{_OUT}/predictions_txt/"           # Stage 2 raw SMILES txt
 PLOT_DIR           = f"{_OUT}/plots/"                     # Stage 2 incremental PNGs
@@ -38,12 +39,16 @@ STAGE3_DIR_2_7        = f"{_OUT}/stage3.2.7_analysis/"           # Stage 3 grids
 STAGE4_DIR         = f"{_OUT}/stage4_br4_matching/"       # Stage 4 BR4 nearest-neighbour analysis
 STAGE5_DIR        = f"{_OUT}/stage5_chembl_matching/"
 CHEMBL_CACHE_PATH = f"{_OUT}/stage5_chembl_matching/chembl_brd4_cache.csv"
+CHEMBL_PCHEMBL_MIN = 5.0   # used when Stage 1.7 must fetch ChEMBL (cache missing)
+# CHEMBL_MASK_FRACTION = 0.25  # optional: fraction of heavy atoms to mask per ChEMBL mol;
+#                               # if unset, stage1_7 prompts or uses PDB-derived rate (7D)
 STAGE6_DIR         = f"{_OUT}/stage6_docking/"
 
 #STAGE6_DIR         = f"/content/drive/MyDrive/GenAI4Drug/Mahzabeen/Output/expo02_docking/stage6_docking/"
 STAGE7_DIR = f"{_OUT}/stage7_top_docked/"
 STAGE8_DIR         = f"{_OUT}/stage8_analysis/"               # Stage 8 scatter + Pareto top-10
 STAGE8_INPUT_CSV   = f"{_OUT}/stage6_docking/stage2/both/docking_summary.csv"  # override at prompt if absent
+RDKIT_POLICY_LORA_DIR = f"{_OUT}/stage2_policy_lora/"         # Stage 2 RDKit-policy LoRA adapter
 
 
 # ── GNINA docking binary ───────────────────────────────────────────────────────
@@ -71,6 +76,14 @@ INCLUDE_TYPES = [
 
 # ── ChemBERTa model ────────────────────────────────────────────────────────────
 CHEMBERTA_MODEL = "seyonec/ChemBERTa-zinc-base-v1"
+# SELFIES ChemBERTa (BPE on SELFIES) — used by bpe_mask_adapter for Stage 1 SELFIES paths
+CHEMBERTA_SELFIES_MODEL = "seyonec/BPE_SELFIES_PubChem_shard00_166_5k"
+BPE_MASK_ADAPTER_ENABLED  = False  # adapter over-masks (cascades on atom-mapped SMILES); use 1-atom→1-<mask>
+# Clean masking: mask exactly the requested atoms, keep all other atoms in
+# ChemBERTa's native bare form (C, c, O) instead of bracketed [CH3], [cH].
+# Only applies when BPE_MASK_ADAPTER_ENABLED is False.
+CLEAN_SMILES_MASKING      = True
+USE_STORED_MASKED_SMILES  = True   # Stage 1.9: read masked_smiles from JSON when indices match
 
 # ── Stage 1.5: random masking knobs ───────────────────────────────────────────
 RANDOM_MASK_SEED = 17

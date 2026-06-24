@@ -85,23 +85,275 @@ import os
 import shutil
 import sys
 import time
+from collections import Counter, defaultdict
 from typing import Dict, List, Optional, Tuple
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 from rdkit import Chem
+from rdkit.Chem import rdFingerprintGenerator
+from rdkit.DataStructs import TanimotoSimilarity
 
 import config
 
-# ── Reuse ALL analysis functions from Stage 4 unchanged ──────────────────────
-from stage4_br4_matching import (
-    build_closeness_summary,
-    find_nearest_br4,
-    load_br4_ligands,       # reads cache CSV using "Ligand Code" / "Smiles" columns
-    load_pool_for_ligand,
-    plot_nn_frequency,
-    plot_similarity_histogram,
-    _safe,
-)
+# ── Stage 5 is fully self-contained — no import from stage4 required ─────────
+
+_FP_GEN = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
+
+
+def _safe(s: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in s)
+
+
+def _read_smiles_from_txt(path: str) -> List[str]:
+    valid = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                smi = line.strip()
+                if smi and Chem.MolFromSmiles(smi) is not None:
+                    valid.append(smi)
+    except Exception:
+        pass
+    return valid
+
+
+def _fp(smiles: str):
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+    return _FP_GEN.GetFingerprint(mol)
+
+
+def load_br4_ligands(csv_path: str, min_heavy_atoms: int = 7) -> List[Tuple[str, str]]:
+    df = pd.read_csv(csv_path)
+    smiles_col = next((c for c in df.columns if c.strip().lower() in ("smiles", "smile")), None)
+    label_col  = next((c for c in df.columns if c.strip().lower() in ("ligand code", "ligand_code")), None)
+    seen_smiles: dict = {}
+    for _, row in df.iterrows():
+        raw_smi = str(row[smiles_col]).strip()
+        label   = str(row[label_col]).strip()
+        mol = Chem.MolFromSmiles(raw_smi)
+        if mol is None:
+            continue
+        if mol.GetNumHeavyAtoms() < min_heavy_atoms:
+            continue
+        canon = Chem.MolToSmiles(mol)
+        if canon not in seen_smiles:
+            seen_smiles[canon] = label
+    return [(label, canon) for canon, label in seen_smiles.items()]
+
+
+def find_nearest_br4(
+    generated_smiles: List[str],
+    br4_ligands: List[Tuple[str, str]],
+) -> List[Tuple[str, str, float]]:
+    br4_fps = [(label, _fp(smi)) for label, smi in br4_ligands]
+    br4_fps = [(label, fp) for label, fp in br4_fps if fp is not None]
+    results = []
+    for gen_smi in generated_smiles:
+        gen_fp = _fp(gen_smi)
+        if gen_fp is None:
+            continue
+        best_label, best_score = None, -1.0
+        for label, br4_fp in br4_fps:
+            score = TanimotoSimilarity(gen_fp, br4_fp)
+            if score > best_score:
+                best_score = score
+                best_label = label
+        if best_label is not None:
+            results.append((gen_smi, best_label, float(best_score)))
+    return results
+
+
+def load_pool_for_ligand(lig_dir: str, pool_choice: str) -> List[str]:
+    pool = []
+    if pool_choice in ("ia", "both"):
+        for f in glob.glob(os.path.join(lig_dir, "ia_mask*.txt")):
+            pool.extend(_read_smiles_from_txt(f))
+    if pool_choice in ("rand", "both"):
+        for f in glob.glob(os.path.join(lig_dir, "rand_mask*.txt")):
+            pool.extend(_read_smiles_from_txt(f))
+    return list(set(pool))
+
+
+def build_closeness_summary(
+    nn_results: List[Tuple[str, str, float]],
+    threshold: float,
+    lig_id: str,
+) -> str:
+    n_total = len(nn_results)
+    if n_total == 0:
+        return f"  No generated molecules could be compared for {lig_id}.\n"
+    above    = [(smi, label, score) for smi, label, score in nn_results if score >= threshold]
+    n_above  = len(above)
+    n_below  = n_total - n_above
+    fraction = n_above / n_total if n_total > 0 else 0
+    lines    = [f"  Source ligand  : {lig_id}",
+                f"  Generated mols : {n_total}",
+                f"  Threshold T    : {threshold:.2f}", ""]
+    if n_above == 0:
+        lines.append(f"  ✗ None of the {n_total} generated molecules have a match with Tanimoto >= {threshold:.2f}.")
+        return "\n".join(lines) + "\n"
+    label_counts    = Counter(label for _, label, _ in above)
+    dominant_label, dominant_count = label_counts.most_common(1)[0]
+    dominant_scores = [s for _, l, s in above if l == dominant_label]
+    median_sim      = float(np.median(dominant_scores))
+    all_same        = (len(label_counts) == 1)
+    if all_same and n_above == n_total:
+        lines.append(f"  ✓ All {n_total}/{n_total} generated molecules are most similar to \'{dominant_label}\' (T >= {threshold:.2f}, med = {median_sim:.3f}).")
+    elif all_same:
+        lines.append(f"  ✓ {n_above}/{n_total} ({fraction*100:.0f}%) generated molecules are most similar to \'{dominant_label}\' (T >= {threshold:.2f}, med = {median_sim:.3f}).")
+        lines.append(f"    {n_below}/{n_total} have no match above threshold.")
+    else:
+        lines.append(f"  ✓ {n_above}/{n_total} ({fraction*100:.0f}%) generated molecules have a nearest neighbour with T >= {threshold:.2f}.")
+        lines.append(f"    Dominant BR4 ligand: \'{dominant_label}\' ({dominant_count}/{n_above} of those above threshold, median similarity = {median_sim:.3f}).")
+        if n_below:
+            lines.append(f"    {n_below}/{n_total} have no match above threshold.")
+        lines.append("    Full breakdown (above threshold only):")
+        for lbl, count in label_counts.most_common():
+            lbl_scores = [s for _, l, s in above if l == lbl]
+            lbl_med    = float(np.median(lbl_scores))
+            lines.append(f"      \'{lbl}\': {count} mol(s), median similarity = {lbl_med:.3f}")
+    return "\n".join(lines) + "\n"
+
+
+def plot_similarity_histogram(
+    nn_results: List[Tuple[str, str, float]],
+    threshold: float,
+    lig_id: str,
+    out_path: str,
+) -> bool:
+    if not nn_results:
+        return False
+    scores = [score for _, _, score in nn_results]
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.hist(scores, bins=np.linspace(0, 1, 21), color="#4FC3F7", edgecolor="black")
+    ax.axvline(threshold, color="red", linestyle="--", linewidth=2,
+               label=f"Threshold ({threshold})")
+    ax.set_title(f"Nearest-Neighbour Similarity — {lig_id}")
+    ax.set_xlabel("Tanimoto Similarity")
+    ax.set_ylabel("Count")
+    ax.set_xlim(0, 1)
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300)
+    plt.close()
+    return True
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  PDB LABEL ENRICHMENT
+# ════════════════════════════════════════════════════════════════════════════
+
+def load_pdb_label_map(ref_csv_path: str) -> Dict[str, str]:
+    """
+    Read BR4_PDB_Data.csv and return {Lig_ChEMBL_ID → PDB ID}.
+
+    Used to enrich x-axis labels in plot_nn_frequency:
+      "CHEMBL1957266"  →  "CHEMBL1957266 (5HLS)"
+
+    Only entries where Lig_ChEMBL_ID is non-empty are included.
+    If a ChEMBL ID maps to multiple PDB entries, the first encountered is used.
+    """
+    result: Dict[str, str] = {}
+    try:
+        df = pd.read_csv(ref_csv_path)
+        # Column names from BR4_PDB_Data.csv: PDB ID, Lig_ChEMBL_ID
+        pdb_col    = next((c for c in df.columns if "pdb" in c.lower() and "id" in c.lower()), None)
+        chembl_col = next((c for c in df.columns if "lig_chembl" in c.lower()), None)
+        if pdb_col is None or chembl_col is None:
+            print(f"  ⚠️  Could not find PDB ID / Lig_ChEMBL_ID columns in {ref_csv_path}")
+            return result
+        for _, row in df.iterrows():
+            cid = str(row[chembl_col]).strip()
+            pid = str(row[pdb_col]).strip()
+            if cid and cid.lower() not in ("nan", "") and pid and pid.lower() not in ("nan", ""):
+                if cid not in result:
+                    result[cid] = pid
+    except Exception as e:
+        print(f"  ⚠️  Could not load PDB label map: {e}")
+    return result
+
+
+def plot_nn_frequency(
+    nn_results: List[Tuple[str, str, float]],
+    threshold: float,
+    lig_id: str,
+    out_path: str,
+    pdb_label_map: Optional[Dict[str, str]] = None,
+) -> bool:
+    """
+    Stacked bar chart of nearest-neighbour frequencies (above threshold).
+    Bars are coloured by similarity score bins, median annotated on top.
+
+    pdb_label_map : {ChEMBL_ID → PDB_ID} from load_pdb_label_map().
+                    When supplied, x-axis labels become "CHEMBLXXXXX (PDBID)"
+                    for ChEMBL IDs that have a PDB entry.
+    """
+    above = [(label, score) for smi, label, score in nn_results if score >= threshold]
+    if not above:
+        return False
+
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+
+    label_scores: Dict[str, list] = defaultdict(list)
+    for label, score in above:
+        label_scores[label].append(score)
+
+    raw_labels = sorted(label_scores.keys(),
+                        key=lambda k: len(label_scores[k]), reverse=True)
+
+    # Enrich labels: "CHEMBL1957266" → "CHEMBL1957266 (5HLS)" if PDB entry exists
+    def _enrich(lbl: str) -> str:
+        if pdb_label_map and lbl in pdb_label_map:
+            return f"{lbl} ({pdb_label_map[lbl]})"
+        return lbl
+
+    display_labels = [_enrich(lbl) for lbl in raw_labels]
+
+    bins = [
+        (threshold, 0.6,  "#FFD54F", f"Low ({threshold:.2f} - 0.60)"),
+        (0.6,       0.8,  "#81C784", "Medium (0.60 - 0.80)"),
+        (0.8,       1.01, "#388E3C", "High (0.80 - 1.00)"),
+    ]
+
+    fig, ax = plt.subplots(figsize=(max(10, len(raw_labels) * 1.2), 6))
+    x_positions = np.arange(len(raw_labels))
+
+    for idx, (raw_lbl, disp_lbl) in enumerate(zip(raw_labels, display_labels)):
+        scores      = label_scores[raw_lbl]
+        median_val  = float(np.median(scores))
+        total_h     = 0
+        for b_min, b_max, color, _ in bins:
+            count = sum(1 for s in scores if b_min <= s < b_max)
+            if count > 0:
+                ax.bar(x_positions[idx], count, bottom=total_h,
+                       color=color, edgecolor="black", width=0.6)
+                total_h += count
+        ax.text(x_positions[idx],
+                total_h + max(1, total_h * 0.02),
+                f"Med: {median_val:.2f}",
+                ha="center", va="bottom",
+                fontsize=9, fontweight="bold", rotation=45, color="black")
+
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels(display_labels, rotation=45, ha="right")
+    ax.set_ylabel("Count of Generated Molecules")
+    ax.set_title(f"Nearest-Neighbour Frequency (T \u2265 {threshold:.2f}) \u2014 {lig_id}")
+
+    from matplotlib.patches import Patch
+    legend_elements = [Patch(facecolor=c, edgecolor="black", label=l)
+                       for _, _, c, l in bins]
+    ax.legend(handles=legend_elements, title="Similarity Range")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300)
+    plt.close()
+    return True
 
 # BRD4 ChEMBL target ID
 BRD4_CHEMBL_TARGET = "CHEMBL1163125"
@@ -397,6 +649,93 @@ def load_or_fetch_chembl(
 #  MAIN ANALYSIS FUNCTION
 # ════════════════════════════════════════════════════════════════════════════
 
+def _draw_chembl_boxplot(
+    data:       list,
+    labels:     list,
+    tag:        str,
+    strategy:   str,
+    out_path:   str,
+) -> None:
+    """Draw and save one ChEMBL summary boxplot for a single strategy."""
+    fig, ax = plt.subplots(figsize=(max(8, len(labels) * 1.6), 6),
+                           facecolor="#FAFAFA")
+    bp = ax.boxplot(data, patch_artist=True, tick_labels=labels,
+                    medianprops=dict(color="red", linewidth=2))
+    color = {"ia": "#1f77b4", "rand": "#d62728"}.get(strategy, "#2ca02c")
+    for patch in bp["boxes"]:
+        patch.set_facecolor(color)
+        patch.set_alpha(0.6)
+    ax.set_xlabel("Ligand Group", fontsize=11)
+    ax.set_ylabel("Tanimoto Similarity to Nearest ChEMBL Neighbour", fontsize=11)
+    ax.set_title(
+        f"ChEMBL Nearest-Neighbour Tanimoto — All Ligands  ({tag})\n"
+        f"Stage 5 summary  (N={len(labels)} groups, all nn scores)",
+        fontsize=12, fontweight="bold",
+    )
+    ax.set_ylim(0, 1)
+    ax.axhline(0.4, color="#AAAAAA", linestyle="--",
+               linewidth=0.8, label="T = 0.40 reference")
+    ax.legend(fontsize=9)
+    ax.grid(True, axis="y", linestyle="--", alpha=0.35)
+    ax.set_facecolor("#FAFAFA")
+    plt.xticks(rotation=30, ha="right")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  🖼  {os.path.basename(out_path)}")
+
+
+def plot_summary_boxplot_stage5(
+    all_results: Dict[str, dict],
+    stage5_dir:  str,
+    pool_choice: str,
+) -> None:
+    """
+    Summary boxplot(s) for Stage 5 — all ligand groups side by side.
+
+    Outputs (in stage5_dir/summary_plot/):
+      pool_choice = "ia"   → 1 plot: boxplot_chembl_tanimoto_ia.png
+      pool_choice = "rand" → 1 plot: boxplot_chembl_tanimoto_rand.png
+      pool_choice = "both" → 2 plots:
+                               boxplot_chembl_tanimoto_ia.png
+                               boxplot_chembl_tanimoto_rand.png
+    """
+    out_dir = os.path.join(stage5_dir, "summary_plot")
+    os.makedirs(out_dir, exist_ok=True)
+    lig_ids = sorted(all_results.keys())
+
+    def _collect(score_key: str, result_subkey: Optional[str] = None):
+        """Return (labels, data) for one strategy."""
+        labels_, data_ = [], []
+        for lid in lig_ids:
+            r = all_results[lid]
+            sub = r.get(result_subkey, {}) if result_subkey else r
+            scores = sub.get(score_key, [])
+            if scores:
+                labels_.append(_safe(lid))
+                data_.append(scores)
+        return labels_, data_
+
+    # Determine which plots to produce
+    if pool_choice == "ia":
+        tasks = [("ia", "IA only", None)]
+    elif pool_choice == "rand":
+        tasks = [("rand", "Random only", None)]
+    else:  # both → 2 plots
+        tasks = [
+            ("ia",   "IA only",      "ia"),
+            ("rand", "Random only",  "rand"),
+        ]
+
+    for strategy, tag, subkey in tasks:
+        labels, data = _collect("nn_scores", subkey)
+        if not data:
+            print(f"  ⚠️  Stage 5 summary boxplot ({strategy}): no data. Skipped.")
+            continue
+        out_path = os.path.join(out_dir, f"boxplot_chembl_tanimoto_{strategy}.png")
+        _draw_chembl_boxplot(data, labels, tag, strategy, out_path)
+
+
 def run_stage5(
     pred_dir:        Optional[str] = None,
     stage5_dir:      Optional[str] = None,
@@ -418,12 +757,15 @@ def run_stage5(
     -------
     Dict keyed by ligand_id → same structure as stage4.run_stage4()
     """
-    pred_dir   = pred_dir   
-    # ── FIX: removed 'out_dir' scope error, defaults to config.STAGE5_DIR
-    stage5_dir = stage5_dir or config.STAGE5_DIR 
+    pred_dir   = pred_dir
+    stage5_dir = stage5_dir or config.STAGE5_DIR
     cache_path = cache_path or config.CHEMBL_CACHE_PATH
 
     os.makedirs(stage5_dir, exist_ok=True)
+
+    # ── Load PDB label map from BR4_PDB_Data.csv (optional enrichment) ────────
+    pdb_label_map = load_pdb_label_map(config.REF_CSV_PATH)
+    print(f"  PDB label map loaded: {len(pdb_label_map)} ChEMBL→PDB entries")
 
     # ── Load ChEMBL molecules ─────────────────────────────────────────────────
     chembl_mols = load_or_fetch_chembl(pchembl_min, cache_path, use_cache)
@@ -474,57 +816,114 @@ def run_stage5(
         print(f"Ligand: {lig_id}  |  pool: {pool_choice}")
         print(f"{'='*60}")
 
-        # Load generated pool (reuses Stage 4 function — Assumption A5)
-        pool = load_pool_for_ligand(lig_dir, pool_choice)
-        print(f"  Generated molecules in pool: {len(pool)}")
+        def _run_one_strategy(
+            strategy_pool:  list,
+            strategy_label: str,
+            suffix:         str,
+        ) -> dict:
+            """
+            Run nn search + plots + summary for one strategy pool.
+            suffix : "_ia", "_rand", or "" (combined/both).
+            Returns result dict.
+            """
+            if not strategy_pool:
+                print(f"  ⚠️  Empty pool for {suffix or 'combined'}. Skipping.")
+                return {}
 
-        if not pool:
-            print("  ⚠️  Empty pool. Skipping.")
-            continue
+            nn   = find_nearest_br4(strategy_pool, chembl_ligands)
+            summ = build_closeness_summary(nn, threshold, lig_id)
+            print(f"  [{suffix or 'combined'}] {len(strategy_pool)} molecules, "
+                  f"{len(nn)} nn-pairs")
+            print(summ)
 
-        # Nearest-neighbour search (reuses Stage 4 — Assumption A5)
-        nn_results = find_nearest_br4(pool, chembl_ligands)
-        print(f"  Nearest-neighbour pairs computed: {len(nn_results)}")
+            s_path = os.path.join(
+                out_dir,
+                f"closeness_summary_{_safe(lig_id)}{suffix}.txt",
+            )
+            with open(s_path, "w", encoding="utf-8") as fh:
+                fh.write("Stage 5 — ChEMBL BRD4 Nearest-Neighbour Closeness Summary\n")
+                fh.write(f"ChEMBL target  : {BRD4_CHEMBL_TARGET}\n")
+                fh.write(f"pChEMBL ≥      : {pchembl_min}\n")
+                fh.write(f"Pool choice    : {strategy_label}\n")
+                fh.write(f"Min heavy atoms: {min_heavy_atoms}\n\n")
+                fh.write(summ)
+            print(f"  💾 {os.path.basename(s_path)}")
 
-        # Closeness summary (reuses Stage 4 — Assumption A5)
-        summary = build_closeness_summary(nn_results, threshold, lig_id)
-        print(summary)
+            sim_ok = plot_similarity_histogram(
+                nn_results = nn,
+                threshold  = threshold,
+                lig_id     = lig_id,
+                out_path   = os.path.join(
+                    out_dir,
+                    f"similarity_score_histogram_{_safe(lig_id)}{suffix}.png",
+                ),
+            )
+            freq_ok = plot_nn_frequency(
+                nn_results    = nn,
+                threshold     = threshold,
+                lig_id        = lig_id,
+                out_path      = os.path.join(
+                    out_dir,
+                    f"nearest_neighbour_frequency_{_safe(lig_id)}{suffix}.png",
+                ),
+                pdb_label_map = pdb_label_map,
+            )
+            if sim_ok:
+                print(f"  🖼  similarity_score_histogram_{_safe(lig_id)}{suffix}.png saved.")
+            if freq_ok:
+                print(f"  🖼  nearest_neighbour_frequency_{_safe(lig_id)}{suffix}.png saved.")
 
-        summary_path = os.path.join(out_dir, "closeness_summary.txt")
-        with open(summary_path, "w", encoding="utf-8") as f:
-            f.write("Stage 5 — ChEMBL BRD4 Nearest-Neighbour Closeness Summary\n")
-            f.write(f"ChEMBL target  : {BRD4_CHEMBL_TARGET}\n")
-            f.write(f"pChEMBL ≥      : {pchembl_min}\n")
-            f.write(f"Pool choice    : {pool_choice}\n")
-            f.write(f"Min heavy atoms: {min_heavy_atoms}\n\n")
-            f.write(summary)
-        print(f"  💾 Summary saved: {summary_path}")
+            return {
+                "nn_results":    nn,
+                "summary_text":  summ,
+                "sim_hist_ok":   sim_ok,
+                "freq_chart_ok": freq_ok,
+                # Raw Tanimoto scores (all nn scores regardless of threshold)
+                "nn_scores": [score for _, _, score in nn],
+            }
 
-        # Plots (reuse Stage 4 — Assumption A5)
-        sim_ok = plot_similarity_histogram(
-            nn_results = nn_results,
-            threshold  = threshold,
-            lig_id     = lig_id,
-            out_path   = os.path.join(out_dir, "similarity_score_histogram.png"),
-        )
-        freq_ok = plot_nn_frequency(
-            nn_results = nn_results,
-            threshold  = threshold,
-            lig_id     = lig_id,
-            out_path   = os.path.join(out_dir, "nearest_neighbour_frequency.png"),
-        )
-        if sim_ok:
-            print(f"  🖼  similarity_score_histogram.png saved.")
-        if freq_ok:
-            print(f"  🖼  nearest_neighbour_frequency.png saved.")
+        # ── Load pools and run per strategy (Option B + Option A) ─────────────
+        if pool_choice == "ia":
+            ia_pool = load_pool_for_ligand(lig_dir, "ia")
+            if not ia_pool:
+                print("  ⚠️  Empty IA pool. Skipping.")
+                continue
+            r = _run_one_strategy(ia_pool, "ia", "_ia")
+            all_results[lig_id] = {"n_generated": len(ia_pool), **r}
 
-        all_results[lig_id] = {
-            "n_generated":    len(pool),
-            "nn_results":     nn_results,
-            "summary_text":   summary,
-            "sim_hist_ok":    sim_ok,
-            "freq_chart_ok":  freq_ok,
-        }
+        elif pool_choice == "rand":
+            rand_pool = load_pool_for_ligand(lig_dir, "rand")
+            if not rand_pool:
+                print("  ⚠️  Empty rand pool. Skipping.")
+                continue
+            r = _run_one_strategy(rand_pool, "rand", "_rand")
+            all_results[lig_id] = {"n_generated": len(rand_pool), **r}
+
+        else:  # both
+            # Combined pool (no suffix — Option A: keep existing combined file)
+            both_pool = load_pool_for_ligand(lig_dir, "both")
+            if not both_pool:
+                print("  ⚠️  Empty pool. Skipping.")
+                continue
+            r_both = _run_one_strategy(both_pool, "both", "")
+
+            # IA-only (suffix _ia)
+            ia_pool   = load_pool_for_ligand(lig_dir, "ia")
+            r_ia      = _run_one_strategy(ia_pool, "ia", "_ia")
+
+            # Random-only (suffix _rand)
+            rand_pool = load_pool_for_ligand(lig_dir, "rand")
+            r_rand    = _run_one_strategy(rand_pool, "rand", "_rand")
+
+            all_results[lig_id] = {
+                "n_generated": len(both_pool),
+                "combined":    r_both,
+                "ia":          r_ia,
+                "rand":        r_rand,
+            }
+
+    # ── Summary boxplot: all ligands side by side ───────────────────────────
+    plot_summary_boxplot_stage5(all_results, stage5_dir, pool_choice)
 
     return all_results
 
@@ -623,9 +1022,9 @@ def _run_test() -> bool:
         check(len(r["nn_results"]) > 0,
               "nn_results non-empty")
         check(r["sim_hist_ok"],
-              "similarity_score_histogram.png produced")
+              "similarity_score_histogram_{lig_id_safe}.png produced")
         check(r["freq_chart_ok"],
-              "nearest_neighbour_frequency.png produced")
+              "nearest_neighbour_frequency_{lig_id_safe}.png produced")
 
         # Solvents must be filtered
         labels_used = {label for _, label, _ in r["nn_results"]}
@@ -639,9 +1038,10 @@ def _run_test() -> bool:
 
         # Output files on disk
         out_dir = os.path.join(stage5_dir, _safe(lig_id))
-        for fname in ["similarity_score_histogram.png",
-                      "nearest_neighbour_frequency.png",
-                      "closeness_summary.txt"]:
+        lig_id_safe = _safe(lig_id)
+        for fname in [f"similarity_score_histogram_{lig_id_safe}.png",
+                      f"nearest_neighbour_frequency_{lig_id_safe}.png",
+                      f"closeness_summary_{lig_id_safe}.txt"]:
             check(os.path.exists(os.path.join(out_dir, fname)),
                   f"{fname} on disk")
 
@@ -765,11 +1165,28 @@ def main():
     print(f"   Outputs saved to: {out_dir}")
     print(f"   Ligands analysed: {len(results)}")
     for lig_id, r in sorted(results.items()):
-        print(
-            f"   • {lig_id}  n={r['n_generated']}  "
-            f"sim_hist={'✓' if r['sim_hist_ok'] else '✗'}  "
-            f"freq_chart={'✓' if r['freq_chart_ok'] else '✗'}"
-        )
+        n = r.get("n_generated", 0)
+        # Result structure differs by pool_choice:
+        #   ia/rand  → flat: r["sim_hist_ok"], r["freq_chart_ok"]
+        #   both     → nested: r["combined"]["sim_hist_ok"], r["ia"][...], r["rand"][...]
+        if "combined" in r:
+            c = r["combined"]
+            sim_ok  = c.get("sim_hist_ok",   False)
+            freq_ok = c.get("freq_chart_ok", False)
+            ia_ok   = r.get("ia",   {}).get("sim_hist_ok", False)
+            rnd_ok  = r.get("rand", {}).get("sim_hist_ok", False)
+            print(
+                f"   • {lig_id}  n={n}  "
+                f"combined={'✓' if sim_ok else '✗'}  "
+                f"ia={'✓' if ia_ok else '✗'}  "
+                f"rand={'✓' if rnd_ok else '✗'}"
+            )
+        else:
+            print(
+                f"   • {lig_id}  n={n}  "
+                f"sim_hist={'✓' if r.get('sim_hist_ok') else '✗'}  "
+                f"freq_chart={'✓' if r.get('freq_chart_ok') else '✗'}"
+            )
 
 
 if __name__ == "__main__":

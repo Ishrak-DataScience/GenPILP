@@ -8,10 +8,12 @@ Stage 1 of the pipeline:
 
 Each .meta.json contains:
     • smiles                 – canonical SMILES of the ligand
-    • masked_atom_indices    – 0-based atom indices selected for masking
+    • selfies                – unmasked SELFIES encoding
+    • masked                 – masked SELFIES string (BPE-adapted when enabled)
+    • masked_smiles          – masked SMILES string (BPE-adapted, ChemBERTa-ready)
+    • masked_atom_indices    – 0-based atom indices selected for masking (PLIP)
+    • bpe_adapted_atom_indices / bpe_mask_count — SMILES BPE adapter metadata
     • masked_atoms_detail    – per-atom interaction metadata
-    • ligand                 – {resname, chain, resseq}
-    • (+ SELFIES fields for legacy use)
 
 These JSON files are the handshake with Stage 2.
 
@@ -374,16 +376,32 @@ def is_atom_selfies_token(token: str) -> bool:
 
 def mask_atoms_in_selfies(smiles: str,
                           atom_indices_to_mask: Iterable[int],
-                          mask_token: str = '<mask>'
+                          mask_token: str = '<mask>',
+                          use_bpe_adapter: Optional[bool] = None,
                           ) -> Tuple[str, str, str, List[int]]:
     """
     Convert SMILES → SELFIES, replace selected atom tokens with mask_token.
-    Returns (smiles, selfies, selfies_masked, sorted_masked_indices).
+
+    When BPE adapter is enabled (default), expands atom masks to full BPE token
+    spans using config.CHEMBERTA_SELFIES_MODEL (A5b).
+
+    Returns (smiles, selfies, selfies_masked, sorted_original_atom_indices).
     """
+    original_sorted = sorted(set(int(i) for i in atom_indices_to_mask))
+
+    enabled = (_adapter_enabled()
+               if use_bpe_adapter is None else use_bpe_adapter)
+    if enabled:
+        from bpe_mask_adapter import adapt_selfies_mask
+        result = adapt_selfies_mask(
+            smiles, original_sorted, mask_token=mask_token,
+        )
+        selfies_str = sf.encoder(smiles)
+        return smiles, selfies_str, result.masked_string, original_sorted
+
     selfies_str = sf.encoder(smiles)
     tokens      = list(sf.split_selfies(selfies_str))
-    mask_set    = set(atom_indices_to_mask)
-    masked_sorted = sorted(mask_set)
+    mask_set    = set(original_sorted)
 
     atom_token_positions: Dict[int, int] = {}
     atom_counter = 0
@@ -392,7 +410,7 @@ def mask_atoms_in_selfies(smiles: str,
             atom_token_positions[atom_counter] = i
             atom_counter += 1
 
-    for idx in masked_sorted:
+    for idx in original_sorted:
         if idx not in atom_token_positions:
             raise IndexError(
                 f"Mask index {idx} out of range "
@@ -400,10 +418,14 @@ def mask_atoms_in_selfies(smiles: str,
             )
 
     tokens_masked = tokens[:]
-    for idx in masked_sorted:
+    for idx in original_sorted:
         tokens_masked[atom_token_positions[idx]] = mask_token
 
-    return smiles, selfies_str, ''.join(tokens_masked), masked_sorted
+    return smiles, selfies_str, ''.join(tokens_masked), original_sorted
+
+
+def _adapter_enabled() -> bool:
+    return bool(getattr(config, "BPE_MASK_ADAPTER_ENABLED", True))
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -413,16 +435,135 @@ def mask_atoms_in_selfies(smiles: str,
 _BRACKET_ATOM_RE = re.compile(r"\[[^\]]+\]")
 _MAPNUM_RE       = re.compile(r":(\d+)\]$")
 
+# Organic-subset atoms that appear unbracketed in SMILES.
+_ORGANIC_ONE_CHAR = frozenset("BCNOPSFIbcnops")
+
+
+def _clean_masking_enabled() -> bool:
+    return bool(getattr(config, "CLEAN_SMILES_MASKING", False))
+
+
+def _smiles_output_atom_order(mol: Chem.Mol) -> List[int]:
+    """RDKit atom indices in the order they appear in MolToSmiles output."""
+    prop = "_smilesAtomOutputOrder"
+    if mol.HasProp(prop):
+        raw = mol.GetProp(prop).strip()
+        if raw.startswith("["):
+            raw = raw[1: raw.rfind("]")]
+        return [int(x.strip()) for x in raw.split(",") if x.strip()]
+    return list(range(mol.GetNumAtoms()))
+
+
+def _clean_smiles_atom_spans(smiles: str) -> List[Tuple[int, int]]:
+    """
+    Return (start, end) character spans for each atom token in a *clean*
+    (unmapped) SMILES string, in left-to-right output order.
+
+    Handles bracket atoms ([...]), two-char organics (Cl, Br) and the
+    unbracketed organic subset. Ring digits, bonds, branches, '%', '.', etc.
+    are skipped (they are not atoms).
+    """
+    spans: List[Tuple[int, int]] = []
+    i, n = 0, len(smiles)
+    while i < n:
+        ch = smiles[i]
+        if ch == "[":
+            end = smiles.index("]", i)
+            spans.append((i, end + 1))
+            i = end + 1
+        elif ch == "C" and i + 1 < n and smiles[i + 1] == "l":
+            spans.append((i, i + 2)); i += 2
+        elif ch == "B" and i + 1 < n and smiles[i + 1] == "r":
+            spans.append((i, i + 2)); i += 2
+        elif ch in _ORGANIC_ONE_CHAR:
+            spans.append((i, i + 1)); i += 1
+        else:
+            i += 1
+    return spans
+
+
+def mask_atoms_in_smiles_clean(smiles: str,
+                               atom_indices_to_mask: Iterable[int],
+                               tokenizer,
+                               ) -> str:
+    """
+    Mask the requested 0-based atom indices, producing a CLEAN SMILES string
+    where every unmasked atom keeps ChemBERTa's native form (bare 'C', 'c',
+    'O', ...) instead of the bracketed '[CH3]', '[cH]' artifacts created by the
+    atom-map round-trip.
+
+    Each masked atom becomes exactly one tokenizer.mask_token (1 atom -> 1
+    <mask>), matching the assumption of generate_smiles_sequential.
+
+    Raises ValueError if the SMILES is invalid or atom/token counts disagree;
+    callers fall back to the legacy path in that case.
+    """
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError(f"Invalid SMILES: {smiles}")
+
+    mask_token = tokenizer.mask_token
+    mask_set   = {int(i) for i in atom_indices_to_mask}
+
+    clean = Chem.MolToSmiles(mol, canonical=True)
+    order = _smiles_output_atom_order(mol)
+    spans = _clean_smiles_atom_spans(clean)
+
+    if len(spans) != len(order):
+        raise ValueError(
+            f"Atom-span count ({len(spans)}) != atom count ({len(order)}) "
+            f"for SMILES {clean!r}"
+        )
+
+    # Map original atom index -> char span in the clean output string.
+    idx_to_span = {order[k]: spans[k] for k in range(len(order))}
+
+    mask_spans = sorted(idx_to_span[i] for i in mask_set if i in idx_to_span)
+    if not mask_spans:
+        return clean
+
+    parts: List[str] = []
+    pos = 0
+    for start, end in mask_spans:
+        parts.append(clean[pos:start])
+        parts.append(mask_token)
+        pos = end
+    parts.append(clean[pos:])
+    return "".join(parts)
+
 
 def mask_atoms_in_smiles(smiles: str,
                          atom_indices_to_mask: Iterable[int],
-                         tokenizer) -> str:
+                         tokenizer,
+                         use_bpe_adapter: Optional[bool] = None,
+                         ) -> str:
     """
     Replace the specified 0-based atom indices in *smiles* with
-    tokenizer.mask_token  (e.g. '<mask>').
+    tokenizer.mask_token (e.g. '<mask>').
+
+    When BPE adapter is enabled (default), atom indices are expanded to full
+    ChemBERTa BPE token spans (one <mask> per BPE token) before encoding.
 
     This function is imported by stage2_molecule_generation.py.
     """
+    enabled = (_adapter_enabled()
+               if use_bpe_adapter is None else use_bpe_adapter)
+    if enabled:
+        from bpe_mask_adapter import adapt_smiles_mask
+        result = adapt_smiles_mask(
+            smiles, atom_indices_to_mask, tokenizer=tokenizer,
+        )
+        return result.masked_string
+
+    # Clean masking: bare atoms everywhere except the masked positions.
+    if _clean_masking_enabled():
+        try:
+            return mask_atoms_in_smiles_clean(
+                smiles, atom_indices_to_mask, tokenizer,
+            )
+        except Exception:
+            pass   # fall through to the legacy bracketed path on any failure
+
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         raise ValueError(f"Invalid SMILES: {smiles}")
@@ -739,9 +880,16 @@ def run_pipeline(pdb_path: str,
         smiles, masked_indices, mask_token=mask_token
     )
 
+    from bpe_mask_adapter import build_smiles_mask_json_fields
+    smiles_mask_fields = build_smiles_mask_json_fields(smiles, masked_sorted)
+
     # 4) Build per-atom detail metadata
-    tokens_in     = list(sf.split_selfies(selfies_in))
-    tokens_masked = list(sf.split_selfies(selfies_masked))
+    tokens_in = list(sf.split_selfies(selfies_in))
+    try:
+        tokens_masked = list(sf.split_selfies(selfies_masked))
+    except Exception:
+        # BPE-adapted strings may contain literal <mask> spans (not valid SELFIES)
+        tokens_masked = []
     atom_token_index_map: Dict[int, int] = {}
     atom_counter = 0
     for i, tok in enumerate(tokens_in):
@@ -777,6 +925,7 @@ def run_pipeline(pdb_path: str,
         "masked":              selfies_masked,
         "mask_token":          mask_token,
         "masked_atom_indices": masked_sorted,
+        **smiles_mask_fields,
         "include_types":       list(include_types),
         "masking_mode":        "non-attractive" if mask_non_attractive else "attractive",
         "pdb":                 pdb_path,
@@ -804,6 +953,63 @@ def run_pipeline(pdb_path: str,
 #  ENTRY POINT
 # ════════════════════════════════════════════════════════════════════════════
 
+def _select_pipeline_inputs() -> List[dict]:
+    """
+    Prompt the user to choose which ligand(s) from config.PIPELINE_INPUTS to
+    process: all of them, or a comma-separated subset selected by number.
+
+    Re-prompts until a valid choice is entered. Returns the selected input
+    dicts in menu order (duplicates removed).
+    """
+    inputs = list(config.PIPELINE_INPUTS)
+    if not inputs:
+        return []
+
+    print("\n  Available ligands:")
+    for i, inp in enumerate(inputs, start=1):
+        tag = f"{inp['resname']}_{inp['chain']}_{inp['resseq']}"
+        print(f"    {i:>2d} : {tag:<16s}  (pdb: {inp['pdb_path']})")
+    print("    all : run every ligand listed above  [default]")
+
+    while True:
+        raw = input(
+            "\n  Select ligand(s) — comma-separated numbers (e.g. 1,3) "
+            "or 'all' [all]: "
+        ).strip().lower()
+
+        if raw in ("", "all"):
+            print(f"\n  ✅ Selected: ALL {len(inputs)} ligand(s).")
+            return inputs
+
+        tokens = [t.strip() for t in raw.split(",") if t.strip()]
+        try:
+            picks = [int(t) for t in tokens]
+        except ValueError:
+            print("    Please enter numbers separated by commas, or 'all'.")
+            continue
+
+        if not picks:
+            print("    Please enter at least one number, or 'all'.")
+            continue
+
+        if any(p < 1 or p > len(inputs) for p in picks):
+            print(f"    Numbers must be between 1 and {len(inputs)}.")
+            continue
+
+        seen: Set[int] = set()
+        selected: List[dict] = []
+        for i, inp in enumerate(inputs, start=1):
+            if i in picks and i not in seen:
+                seen.add(i)
+                selected.append(inp)
+
+        tags = ", ".join(
+            f"{inp['resname']}_{inp['chain']}_{inp['resseq']}" for inp in selected
+        )
+        print(f"\n  ✅ Selected {len(selected)} ligand(s): {tags}")
+        return selected
+
+
 def main():
     os.makedirs(config.MASK_CALC_OUTDIR, exist_ok=True)
 
@@ -811,7 +1017,45 @@ def main():
     print("STAGE 1: MASK CALCULATION")
     print("=" * 60)
 
-    for inp in config.PIPELINE_INPUTS:
+    # ── Ask masking mode at runtime ───────────────────────────────────────────
+    print("""
+  Masking mode:
+    1 : INTERACTION      (mask_non_attractive = False)  [default]
+        Atoms that DO participate in protein-ligand interactions
+        (hydrophobic, H-bond, pi-stacking, salt bridge, etc.) are masked.
+        ChemBERTa reconstructs the interacting atoms — generates molecules
+        with alternative binding groups, scaffold unchanged.
+
+    2 : NON-INTERACTION  (mask_non_attractive = True)
+        Atoms that do NOT participate in interactions are masked.
+        ChemBERTa reconstructs the non-interacting scaffold — generates
+        molecules with alternative scaffolds, binding pharmacophore unchanged.
+""")
+    while True:
+        _mode_raw = input("  Select masking mode (1 / 2) [1]: ").strip()
+        if _mode_raw in ("", "1"):
+            _mask_non_attractive = False
+            print("""
+  ✅ Masking mode : INTERACTION  (mask_non_attractive = False)
+  Interacting atoms will be masked.
+""")
+            break
+        elif _mode_raw == "2":
+            _mask_non_attractive = True
+            print("""
+  ✅ Masking mode : NON-INTERACTION  (mask_non_attractive = True)
+  Non-interacting atoms will be masked.
+""")
+            break
+        else:
+            print("    Please type 1 or 2.")
+
+    selected_inputs = _select_pipeline_inputs()
+    if not selected_inputs:
+        print("\n  ❌ No ligands selected / configured. Exiting.")
+        return
+
+    for inp in selected_inputs:
         tag = f"{inp['resname']}_{inp['chain']}_{inp['resseq']}"
         print(f"\n→ Processing {tag}")
         try:
@@ -828,7 +1072,7 @@ def main():
                     config.MASK_CALC_OUTDIR, tag + "_masked.selfies"
                 ),
                 serial_map_json     = None,
-                mask_non_attractive = False,
+                mask_non_attractive = _mask_non_attractive,
             )
         except Exception as e:
             print(f"  ⚠️  Skipped {tag}: {e}")
