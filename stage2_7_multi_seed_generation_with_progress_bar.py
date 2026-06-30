@@ -93,14 +93,20 @@ except ImportError:  # graceful fallback — bar becomes a no-op
 import config
 from rdkit import RDLogger as _RDLogger
 _RDLogger.DisableLog("rdApp.*")   # suppress RDKit 2D/3D and noise warnings
+from rdkit import Chem
 from stage2_molecule_generation import (
+    generate_smiles,
     generate_smiles_sequential,
+    get_and_reset_generation_debug_counters,
     load_chemberta,
     load_json_folder,
     mask_atoms_in_smiles,
     plot_incremental_results,
+    print_mask_count_generation_debug,
+    reset_generation_debug_counters,
     safe_filename,
 )
+from stage2_token_ratio_plot import plot_token_ratio_results
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -234,7 +240,7 @@ def run_multi_seed_for_ligand(
     stage25_pred_dir: str,
     stage25_base_seed: int,
     num_samples: int = config.INCREMENTAL_NUM_SAMPLES,
-) -> Tuple[List[int], List[int], List[int]]:
+) -> Tuple[List[int], List[int], List[int], List[int], List[int], List[float], List[float]]:
     """
     Run the multi-seed random-pick incremental loop for a single ligand.
 
@@ -246,9 +252,19 @@ def run_multi_seed_for_ligand(
 
     Returns
     -------
-    mask_counts  : [1, 2, …, N]
-    ia_valids    : aggregated unique valid SMILES count per step
-    rand_valids  : aggregated unique valid SMILES count per step
+    mask_counts      : [1, 2, …, N]
+    ia_valids        : union unique valid SMILES count across seeds per step
+                       (used by the absolute plot)
+    rand_valids      : union unique valid SMILES count across seeds per step
+    ia_ratio_valids  : SUM of per-seed unique valid counts per step
+                       (used by the ratio plot — each seed counted independently)
+    rand_ratio_valids: SUM of per-seed unique valid counts per step
+    ia_token_pcts    : mean % of BPE tokens masked across seeds (IA), per step
+    rand_token_pcts  : mean % of BPE tokens masked across seeds (random), per step
+
+    Token-% = (# <mask> tokens in the masked input) / (# BPE tokens of the full
+    clean SMILES), averaged over seeds for each strategy. Used by the Plot-2
+    ratio chart.
     """
     N = min(len(ia_indices), len(rand_indices))
     if len(ia_indices) != len(rand_indices):
@@ -260,9 +276,26 @@ def run_multi_seed_for_ligand(
     lig_out_dir = os.path.join(stage27_pred_dir, safe_filename(lig_id))
     os.makedirs(lig_out_dir, exist_ok=True)
 
-    mask_counts: List[int] = []
-    ia_valids:   List[int] = []
-    rand_valids: List[int] = []
+    mask_counts:       List[int] = []
+    ia_valids:         List[int] = []
+    rand_valids:       List[int] = []
+    ia_ratio_valids:   List[int] = []
+    rand_ratio_valids: List[int] = []
+    ia_tok_pcts:   List[float] = []
+    rand_tok_pcts: List[float] = []
+
+    # Denominator for the token-masking-% (Plot 2): total BPE tokens of the
+    # full, unmasked clean SMILES. Computed once per ligand.
+    mask_token = tokenizer.mask_token
+    try:
+        _clean_smiles = Chem.MolToSmiles(Chem.MolFromSmiles(smiles))
+        total_tokens  = len(
+            tokenizer(_clean_smiles, add_special_tokens=False)["input_ids"]
+        )
+    except Exception:
+        total_tokens = 0
+
+    debug = bool(getattr(config, "GENERATION_COUNT_DEBUG", False))
 
     # Total steps = N mask_counts × len(seeds)
     total_steps = N * len(seeds)
@@ -280,12 +313,42 @@ def run_multi_seed_for_ligand(
     for mask_count in range(1, N + 1):
         tqdm.write(f"\n    ── mask_count = {mask_count}/{N} ──")
 
-        # Aggregate across all seeds
+        # Aggregate across all seeds (union — for absolute plot)
         ia_pool:   Set[str] = set()
         rand_pool: Set[str] = set()
 
+        # Sum of per-seed unique counts (for ratio plot — each seed independent)
+        ia_sum   = 0
+        rand_sum = 0
+
+        # Token-masking fraction per seed (averaged into the Plot-2 x-axis).
+        ia_pct_seed:   List[float] = []
+        rand_pct_seed: List[float] = []
+
+        # Per-mask_count generation debug tallies (Stage 2.7 multi-seed).
+        ia_dbg   = {"rdkit_validate": 0, "sample_draws": 0}
+        rand_dbg = {"rdkit_validate": 0, "sample_draws": 0}
+        fresh_cells  = 0
+        cached_cells = 0
+
         for seed in seeds:
             step_seed = seed + mask_count
+
+            # ── Deterministic index picks ─────────────────────────────────────
+            # Computed every seed (even on cache hits) because the token-% is
+            # derived from the masked input, not the generated output.
+            rng         = random.Random(step_seed)
+            ia_picked   = rng.sample(ia_indices,   mask_count)
+            rng         = random.Random(step_seed)
+            rand_picked = rng.sample(rand_indices, mask_count)
+
+            ia_masked   = mask_atoms_in_smiles(smiles, ia_picked,   tokenizer)
+            rand_masked = mask_atoms_in_smiles(smiles, rand_picked, tokenizer)
+
+            # token-% = (# <mask> tokens) / (# BPE tokens of full clean SMILES)
+            if total_tokens > 0:
+                ia_pct_seed.append(100.0 * ia_masked.count(mask_token)   / total_tokens)
+                rand_pct_seed.append(100.0 * rand_masked.count(mask_token) / total_tokens)
 
             # Update bar label before the (potentially slow) generation call
             pbar.set_postfix_str(
@@ -304,12 +367,17 @@ def run_multi_seed_for_ligand(
             )
 
             if source != "new":
-                ia_pool.update(ia_cached   or [])
-                rand_pool.update(rand_cached or [])
+                _ia_cached   = ia_cached   or []
+                _rand_cached = rand_cached or []
+                ia_pool.update(_ia_cached)
+                rand_pool.update(_rand_cached)
+                ia_sum   += len(_ia_cached)
+                rand_sum += len(_rand_cached)
+                cached_cells += 2
                 tqdm.write(
                     f"      seed={seed:>4d}  step_seed={step_seed}  "
                     f"♻️  reused from {source}  "
-                    f"(+{len(ia_cached or [])} IA, +{len(rand_cached or [])} rand)"
+                    f"(+{len(_ia_cached)} IA, +{len(_rand_cached)} rand)"
                 )
                 pbar.set_postfix_str(
                     f"mask={mask_count}/{N}  seed={seed}  ♻️ cached",
@@ -317,12 +385,6 @@ def run_multi_seed_for_ligand(
                 )
                 pbar.update(1)
                 continue
-
-            # ── Sample indices ────────────────────────────────────────────────
-            rng         = random.Random(step_seed)
-            ia_picked   = rng.sample(ia_indices,   mask_count)
-            rng         = random.Random(step_seed)
-            rand_picked = rng.sample(rand_indices, mask_count)
 
             tqdm.write(
                 f"      seed={seed:>4d}  step_seed={step_seed}  "
@@ -335,10 +397,11 @@ def run_multi_seed_for_ligand(
                 f"mask={mask_count}/{N}  seed={seed}  generating IA …",
                 refresh=True,
             )
-            ia_masked  = mask_atoms_in_smiles(smiles, ia_picked, tokenizer)
             cache_ia   = _seed_cache_path(stage27_pred_dir, lig_id, seed,
                                           mask_count, "ia")
-            ia_preds   = generate_smiles_sequential(
+            if debug:
+                reset_generation_debug_counters()
+            ia_preds   = generate_smiles(
                 smiles_masked = ia_masked,
                 tokenizer     = tokenizer,
                 model         = model,
@@ -346,16 +409,21 @@ def run_multi_seed_for_ligand(
                 num_samples   = num_samples,
                 save_path     = cache_ia,
             )
+            if debug:
+                c = get_and_reset_generation_debug_counters()
+                ia_dbg["rdkit_validate"] += c["rdkit_validate"]
+                ia_dbg["sample_draws"]   += c["sample_draws"]
 
             # ── Generate random predictions ───────────────────────────────────
             pbar.set_postfix_str(
                 f"mask={mask_count}/{N}  seed={seed}  generating rand …",
                 refresh=True,
             )
-            rand_masked = mask_atoms_in_smiles(smiles, rand_picked, tokenizer)
             cache_rand  = _seed_cache_path(stage27_pred_dir, lig_id, seed,
                                            mask_count, "rand")
-            rand_preds  = generate_smiles_sequential(
+            if debug:
+                reset_generation_debug_counters()
+            rand_preds  = generate_smiles(
                 smiles_masked = rand_masked,
                 tokenizer     = tokenizer,
                 model         = model,
@@ -363,9 +431,16 @@ def run_multi_seed_for_ligand(
                 num_samples   = num_samples,
                 save_path     = cache_rand,
             )
+            if debug:
+                c = get_and_reset_generation_debug_counters()
+                rand_dbg["rdkit_validate"] += c["rdkit_validate"]
+                rand_dbg["sample_draws"]   += c["sample_draws"]
 
+            fresh_cells += 2
             ia_pool.update(ia_preds)
             rand_pool.update(rand_preds)
+            ia_sum   += len(ia_preds)
+            rand_sum += len(rand_preds)
             tqdm.write(f"      → new  (+{len(ia_preds)} IA, +{len(rand_preds)} rand)")
             pbar.set_postfix_str(
                 f"mask={mask_count}/{N}  seed={seed}  ✓ new",
@@ -387,10 +462,29 @@ def run_multi_seed_for_ligand(
         mask_counts.append(mask_count)
         ia_valids.append(len(ia_pool))
         rand_valids.append(len(rand_pool))
+        ia_ratio_valids.append(ia_sum)
+        rand_ratio_valids.append(rand_sum)
+        ia_tok_pcts.append(
+            sum(ia_pct_seed) / len(ia_pct_seed) if ia_pct_seed else 0.0
+        )
+        rand_tok_pcts.append(
+            sum(rand_pct_seed) / len(rand_pct_seed) if rand_pct_seed else 0.0
+        )
+
+        if debug:
+            print_mask_count_generation_debug(
+                mask_count,
+                ia_counts    = ia_dbg,
+                rand_counts  = rand_dbg,
+                num_samples  = num_samples,
+                fresh_cells  = fresh_cells,
+                cached_cells = cached_cells,
+                stage_label  = f"Stage 2.7, {len(seeds)} seeds",
+            )
 
     pbar.close()
 
-    return mask_counts, ia_valids, rand_valids
+    return mask_counts, ia_valids, rand_valids, ia_ratio_valids, rand_ratio_valids, ia_tok_pcts, rand_tok_pcts
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -494,7 +588,9 @@ def run_stage27(
         print(f"Rand indices : {rand_indices}")
         print(f"{'='*60}")
 
-        mask_counts, ia_valids, rand_valids = run_multi_seed_for_ligand(
+        (mask_counts, ia_valids, rand_valids,
+         ia_ratio_valids, rand_ratio_valids,
+         ia_tok_pcts, rand_tok_pcts) = run_multi_seed_for_ligand(
             lig_id            = lig_id,
             smiles            = smiles,
             ia_indices        = ia_indices,
@@ -509,6 +605,7 @@ def run_stage27(
             num_samples       = num_samples,
         )
 
+        # Plot 1 — absolute: number of masks vs unique valid SMILES.
         plot_path = plot_incremental_results(
             lig_id      = lig_id,
             mask_counts = mask_counts,
@@ -518,11 +615,30 @@ def run_stage27(
             num_samples = num_samples,
         )
 
+        # Plot 2 — ratio: % tokens masked vs (unique valid / total samples).
+        # Numerator: sum of per-seed unique counts (each seed counted independently).
+        # Denominator: num_samples × n_seeds (total draws across all seeds).
+        ratio_plot_path = plot_token_ratio_results(
+            lig_id          = lig_id,
+            ia_token_pcts   = ia_tok_pcts,
+            rand_token_pcts = rand_tok_pcts,
+            ia_valids       = ia_ratio_valids,
+            rand_valids     = rand_ratio_valids,
+            plot_dir        = stage27_plot_dir,
+            total_samples   = num_samples * len(seeds),
+            denom_label     = f"num_samples × n_seeds = {num_samples * len(seeds)}",
+        )
+
         all_results[lig_id] = {
-            "mask_counts": mask_counts,
-            "ia_valids":   ia_valids,
-            "rand_valids": rand_valids,
-            "plot_path":   plot_path,
+            "mask_counts":       mask_counts,
+            "ia_valids":         ia_valids,
+            "rand_valids":       rand_valids,
+            "ia_ratio_valids":   ia_ratio_valids,
+            "rand_ratio_valids": rand_ratio_valids,
+            "ia_token_pcts":     ia_tok_pcts,
+            "rand_token_pcts":   rand_tok_pcts,
+            "plot_path":         plot_path,
+            "ratio_plot_path":   ratio_plot_path,
         }
 
     return all_results

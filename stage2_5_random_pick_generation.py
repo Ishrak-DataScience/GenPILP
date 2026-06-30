@@ -19,7 +19,8 @@ mask_count atom indices are selected at each step:
 Output files have the same format as Stage 2:
     config.STAGE25_PRED_DIR/<lig_id>/ia_mask{NNN}.txt
     config.STAGE25_PRED_DIR/<lig_id>/rand_mask{NNN}.txt
-    config.STAGE25_PLOT_DIR/<lig_id>_incremental_masking.png
+    config.STAGE25_PLOT_DIR/<lig_id>_incremental_masking.png   (Plot 1 — absolute)
+    config.STAGE25_PLOT_DIR/<lig_id>_token_ratio.png           (Plot 2 — yield ratio)
 
 These outputs are consumed by Stages 3–7 unchanged — just point those stages
 at STAGE25_PRED_DIR instead of PRED_DIR.
@@ -67,16 +68,22 @@ import sys
 from typing import Dict, List, Optional, Tuple
 
 import config
+from rdkit import Chem
 
 # ── Reuse Stage-2 functions unchanged (Assumption A5) ────────────────────────
 from stage2_molecule_generation import (
+    generate_smiles,
     generate_smiles_sequential,
+    get_and_reset_generation_debug_counters,
     load_chemberta,
     load_json_folder,
     mask_atoms_in_smiles,
     plot_incremental_results,
+    print_mask_count_generation_debug,
+    reset_generation_debug_counters,
     safe_filename,
 )
+from stage2_token_ratio_plot import plot_token_ratio_results
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -122,7 +129,7 @@ def run_random_pick_for_ligand(
     pred_dir: str,
     num_samples: int = config.INCREMENTAL_NUM_SAMPLES,
     base_seed: int   = config.RANDOM_MASK_SEED,
-) -> Tuple[List[int], List[int], List[int]]:
+) -> Tuple[List[int], List[int], List[int], List[float], List[float]]:
     """
     Run the random-pick incremental masking loop for a single ligand.
 
@@ -136,9 +143,11 @@ def run_random_pick_for_ligand(
 
     Returns
     -------
-    mask_counts  : [1, 2, …, N]
-    ia_valids    : unique valid SMILES count per step (IA strategy)
-    rand_valids  : unique valid SMILES count per step (random strategy)
+    mask_counts    : [1, 2, …, N]
+    ia_valids      : unique valid SMILES count per step (IA strategy)
+    rand_valids    : unique valid SMILES count per step (random strategy)
+    ia_token_pcts  : % of full-SMILES BPE tokens masked (IA), per step
+    rand_token_pcts: % of full-SMILES BPE tokens masked (random), per step
     """
     N = min(len(ia_indices), len(rand_indices))
     if len(ia_indices) != len(rand_indices):
@@ -150,9 +159,22 @@ def run_random_pick_for_ligand(
     mask_counts: List[int] = []
     ia_valids:   List[int] = []
     rand_valids: List[int] = []
+    ia_tok_pcts:   List[float] = []
+    rand_tok_pcts: List[float] = []
 
     lig_pred_dir = os.path.join(pred_dir, safe_filename(lig_id))
     os.makedirs(lig_pred_dir, exist_ok=True)
+
+    mask_token = tokenizer.mask_token
+    try:
+        _clean_smiles = Chem.MolToSmiles(Chem.MolFromSmiles(smiles))
+        total_tokens  = len(
+            tokenizer(_clean_smiles, add_special_tokens=False)["input_ids"]
+        )
+    except Exception:
+        total_tokens = 0
+
+    debug = bool(getattr(config, "GENERATION_COUNT_DEBUG", False))
 
     for mask_count in range(1, N + 1):
         # ── Random-pick: sample mask_count indices without replacement ─────────
@@ -176,7 +198,9 @@ def run_random_pick_for_ligand(
         # ── Interaction-aware masked SMILES ───────────────────────────────────
         ia_masked = mask_atoms_in_smiles(smiles, ia_picked, tokenizer)
         ia_save   = os.path.join(lig_pred_dir, f"ia_mask{mask_count:03d}.txt")
-        ia_preds  = generate_smiles_sequential(
+        if debug:
+            reset_generation_debug_counters()
+        ia_preds  = generate_smiles(
             smiles_masked = ia_masked,
             tokenizer     = tokenizer,
             model         = model,
@@ -184,12 +208,15 @@ def run_random_pick_for_ligand(
             num_samples   = num_samples,
             save_path     = ia_save,
         )
+        ia_dbg = get_and_reset_generation_debug_counters() if debug else {}
         n_ia = len(ia_preds)
 
         # ── Random masked SMILES ──────────────────────────────────────────────
         rand_masked = mask_atoms_in_smiles(smiles, rand_picked, tokenizer)
         rand_save   = os.path.join(lig_pred_dir, f"rand_mask{mask_count:03d}.txt")
-        rand_preds  = generate_smiles_sequential(
+        if debug:
+            reset_generation_debug_counters()
+        rand_preds  = generate_smiles(
             smiles_masked = rand_masked,
             tokenizer     = tokenizer,
             model         = model,
@@ -197,15 +224,33 @@ def run_random_pick_for_ligand(
             num_samples   = num_samples,
             save_path     = rand_save,
         )
+        rand_dbg = get_and_reset_generation_debug_counters() if debug else {}
         n_rand = len(rand_preds)
 
         print(f"IA valid = {n_ia:>4d}   rand valid = {n_rand:>4d}")
 
+        if debug:
+            print_mask_count_generation_debug(
+                mask_count,
+                ia_counts   = ia_dbg,
+                rand_counts = rand_dbg,
+                num_samples = num_samples,
+                fresh_cells = 2,
+                cached_cells = 0,
+                stage_label = "Stage 2.5",
+            )
+
         mask_counts.append(mask_count)
         ia_valids.append(n_ia)
         rand_valids.append(n_rand)
+        if total_tokens > 0:
+            ia_tok_pcts.append(100.0 * ia_masked.count(mask_token) / total_tokens)
+            rand_tok_pcts.append(100.0 * rand_masked.count(mask_token) / total_tokens)
+        else:
+            ia_tok_pcts.append(0.0)
+            rand_tok_pcts.append(0.0)
 
-    return mask_counts, ia_valids, rand_valids
+    return mask_counts, ia_valids, rand_valids, ia_tok_pcts, rand_tok_pcts
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -289,7 +334,8 @@ def run_stage25(
         print(f"Rand indices (full list): {rand_indices}")
         print(f"{'='*60}")
 
-        mask_counts, ia_valids, rand_valids = run_random_pick_for_ligand(
+        (mask_counts, ia_valids, rand_valids,
+         ia_tok_pcts, rand_tok_pcts) = run_random_pick_for_ligand(
             lig_id       = lig_id,
             smiles       = smiles,
             ia_indices   = ia_indices,
@@ -302,7 +348,7 @@ def run_stage25(
             base_seed    = base_seed,
         )
 
-        # Reuse Stage-2 plotting function unchanged (Assumption A5)
+        # Plot 1 — absolute: number of masks vs unique valid SMILES.
         plot_path = plot_incremental_results(
             lig_id      = lig_id,
             mask_counts = mask_counts,
@@ -312,11 +358,26 @@ def run_stage25(
             num_samples = num_samples,
         )
 
+        # Plot 2 — ratio: % tokens masked vs (unique valid / num_samples).
+        ratio_plot_path = plot_token_ratio_results(
+            lig_id          = lig_id,
+            ia_token_pcts   = ia_tok_pcts,
+            rand_token_pcts = rand_tok_pcts,
+            ia_valids       = ia_valids,
+            rand_valids     = rand_valids,
+            plot_dir        = plot_dir,
+            total_samples   = num_samples,
+            denom_label     = f"num_samples = {num_samples}",
+        )
+
         all_results[lig_id] = {
-            "mask_counts":  mask_counts,
-            "ia_valids":    ia_valids,
-            "rand_valids":  rand_valids,
-            "plot_path":    plot_path,
+            "mask_counts":     mask_counts,
+            "ia_valids":       ia_valids,
+            "rand_valids":     rand_valids,
+            "ia_token_pcts":   ia_tok_pcts,
+            "rand_token_pcts": rand_tok_pcts,
+            "plot_path":       plot_path,
+            "ratio_plot_path": ratio_plot_path,
         }
 
     return all_results

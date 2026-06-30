@@ -1,4 +1,4 @@
-# ── Secrets / credentials ──────────────────────────────────────────────
+# Secrets / credentials
 Token_HF.txt
 *token*.txt
 *.key
@@ -6,14 +6,14 @@ Token_HF.txt
 .env
 .env.*
 
-# ── Python cache / build artifacts ─────────────────────────────────────
+# Python cache / build artifacts
 __pycache__/
 *.py[cod]
 *$py.class
 *.egg-info/
 .ipynb_checkpoints/
 
-# ── Editor / OS ────────────────────────────────────────────────────────
+# Editor / OS
 .vscode/
 .idea/
 .DS_Store

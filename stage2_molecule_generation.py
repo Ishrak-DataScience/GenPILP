@@ -227,6 +227,86 @@ def _partial_smiles_valid(ids: "torch.Tensor", tokenizer) -> bool:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  GENERATION DEBUG COUNTERS  (Stage 2.5 / 2.7 verification)
+# ════════════════════════════════════════════════════════════════════════════
+
+_generation_debug: Dict[str, int] = {
+    "rdkit_validate": 0,
+    "sample_draws":   0,
+}
+
+
+def _generation_count_debug_enabled() -> bool:
+    return bool(getattr(config, "GENERATION_COUNT_DEBUG", False))
+
+
+def reset_generation_debug_counters() -> None:
+    """Zero the per-cell debug counters (call before each generate_smiles)."""
+    _generation_debug["rdkit_validate"] = 0
+    _generation_debug["sample_draws"]   = 0
+
+
+def get_and_reset_generation_debug_counters() -> Dict[str, int]:
+    """Return current counts and reset to zero."""
+    counts = dict(_generation_debug)
+    reset_generation_debug_counters()
+    return counts
+
+
+def _rdkit_validate_smiles(smiles: str):
+    """Final-candidate RDKit parse; counted when GENERATION_COUNT_DEBUG is True."""
+    if _generation_count_debug_enabled():
+        _generation_debug["rdkit_validate"] += 1
+    return Chem.MolFromSmiles(smiles)
+
+
+def _record_sample_draw() -> None:
+    if _generation_count_debug_enabled():
+        _generation_debug["sample_draws"] += 1
+
+
+def print_mask_count_generation_debug(
+    mask_count: int,
+    *,
+    ia_counts: Dict[str, int],
+    rand_counts: Dict[str, int],
+    num_samples: int,
+    fresh_cells: int = 2,
+    cached_cells: int = 0,
+    stage_label: str = "",
+) -> None:
+    """
+    Print one stdout line-block summarising sampling / RDKit validation for a
+    single mask_count step.  Intended for experimental verification only.
+    """
+    total_rdkit = ia_counts["rdkit_validate"] + rand_counts["rdkit_validate"]
+    total_draws = ia_counts["sample_draws"] + rand_counts["sample_draws"]
+    expected_per_cell = num_samples
+
+    header = f"[gen-debug] mask_count={mask_count}"
+    if stage_label:
+        header += f"  ({stage_label})"
+    print(header, flush=True)
+    print(
+        f"    IA   : rdkit_validate={ia_counts['rdkit_validate']:>5d}  "
+        f"sample_draws={ia_counts['sample_draws']:>5d}  "
+        f"(expected {expected_per_cell} each per fresh cell)",
+        flush=True,
+    )
+    print(
+        f"    rand : rdkit_validate={rand_counts['rdkit_validate']:>5d}  "
+        f"sample_draws={rand_counts['sample_draws']:>5d}",
+        flush=True,
+    )
+    print(
+        f"    total: rdkit_validate={total_rdkit}  sample_draws={total_draws}  "
+        f"fresh_cells={fresh_cells}  cached_cells={cached_cells}  "
+        f"(expected rdkit/draws per fresh cell = {expected_per_cell})",
+        flush=True,
+    )
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  SEQUENTIAL ChemBERTa GENERATION
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -281,7 +361,7 @@ def generate_smiles_sequential(
     mask_positions = (base_ids == mask_id).nonzero(as_tuple=True)[0].tolist()
     if not mask_positions:
         clean = smiles_masked.replace(" ", "")
-        if Chem.MolFromSmiles(clean) is not None:
+        if _rdkit_validate_smiles(clean) is not None:
             return [clean]
         return []
 
@@ -293,6 +373,7 @@ def generate_smiles_sequential(
     invalid   = 0
 
     for _ in range(num_samples):
+        _record_sample_draw()
         ids = base_ids.clone()
 
         for pos in mask_positions:
@@ -334,7 +415,7 @@ def generate_smiles_sequential(
                 ids[pos] = topk.indices[chosen]
 
         cand = tokenizer.decode(ids, skip_special_tokens=True).replace(" ", "")
-        if Chem.MolFromSmiles(cand) is not None:
+        if _rdkit_validate_smiles(cand) is not None:
             valid_set.add(cand)
         else:
             invalid += 1
@@ -347,6 +428,133 @@ def generate_smiles_sequential(
             f.write("\n".join(valid_list) + "\n")
 
     return valid_list
+
+
+def generate_smiles_oneshot(
+    smiles_masked: str,
+    tokenizer,
+    model,
+    device: str,
+    top_k: int = config.TOP_K,
+    num_samples: int = config.INCREMENTAL_NUM_SAMPLES,
+    temperature: float = config.TEMPERATURE,
+    save_path: Optional[str] = None,
+    rdkit_logit_filter: bool = True,
+) -> List[str]:
+    """
+    One-shot (parallel) mask filling — ChemBERTa's native MLM decoding.
+
+    A SINGLE forward pass scores every <mask> position at once. Each masked
+    position is then sampled INDEPENDENTLY from that one pass: a mask never sees
+    the token chosen for any other mask (conditional independence given the
+    unmasked context). This is the faithful "predict all masks at once" baseline
+    described by the MLM objective, in contrast to generate_smiles_sequential,
+    which re-runs the model after every fill to capture inter-mask dependencies.
+
+    Cost: exactly one model forward pass per ligand regardless of mask count or
+    num_samples (the per-position distributions are cached and re-sampled),
+    versus N passes per sample for the sequential decoder.
+
+    RDKit logit filtering (rdkit_logit_filter=True, default):
+      Only Pass 1 (vocabulary whitelist) is applied — non-SMILES tokens are set
+      to -inf before sampling. Pass 2 (the sequential structural-consistency
+      check) is intentionally skipped here because it depends on tokens already
+      filled at other positions, which one-shot decoding does not have.
+
+    Returns a sorted list of unique RDKit-valid SMILES.
+    Optionally saves them to save_path (one per line).
+    """
+    max_len = getattr(tokenizer, "model_max_length", 512)
+    if max_len is None or max_len > 1024:
+        max_len = 512
+
+    enc = tokenizer(
+        smiles_masked, return_tensors="pt", truncation=True, max_length=max_len
+    ).to(device)
+    base_ids  = enc["input_ids"][0]
+    base_attn = enc["attention_mask"][0]
+    mask_id   = tokenizer.mask_token_id
+
+    mask_positions = (base_ids == mask_id).nonzero(as_tuple=True)[0].tolist()
+    if not mask_positions:
+        clean = smiles_masked.replace(" ", "")
+        if _rdkit_validate_smiles(clean) is not None:
+            return [clean]
+        return []
+
+    if rdkit_logit_filter:
+        vocab_mask = _build_smiles_vocab_mask(tokenizer).to(device)
+
+    # ── Single forward pass: score every mask position simultaneously ─────────
+    with torch.no_grad():
+        out = model(input_ids=base_ids.unsqueeze(0),
+                    attention_mask=base_attn.unsqueeze(0))
+
+    # Pre-compute the independent top-k distribution at each masked position.
+    per_pos: List[tuple] = []
+    for pos in mask_positions:
+        logits = out.logits[0, pos] / max(temperature, 1e-8)
+        if rdkit_logit_filter:
+            logits = logits.masked_fill(~vocab_mask, float("-inf"))
+            k = min(top_k, int(vocab_mask.sum().item()), logits.shape[0])
+        else:
+            k = min(top_k, logits.shape[0])
+        k = max(k, 1)
+        topk  = torch.topk(logits, k=k)
+        probs = torch.softmax(topk.values, dim=-1)
+        per_pos.append((topk.indices, probs))
+
+    valid_set: set = set()
+    invalid   = 0
+
+    for _ in range(num_samples):
+        _record_sample_draw()
+        ids = base_ids.clone()
+        for (idxs, probs), pos in zip(per_pos, mask_positions):
+            chosen   = torch.multinomial(probs, num_samples=1).item()
+            ids[pos] = idxs[chosen]
+
+        cand = tokenizer.decode(ids, skip_special_tokens=True).replace(" ", "")
+        if _rdkit_validate_smiles(cand) is not None:
+            valid_set.add(cand)
+        else:
+            invalid += 1
+
+    valid_list = sorted(valid_set)
+
+    if save_path:
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        with open(save_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(valid_list) + "\n")
+
+    return valid_list
+
+
+def generate_smiles(
+    smiles_masked: str,
+    tokenizer,
+    model,
+    device: str,
+    **kwargs,
+) -> List[str]:
+    """
+    Dispatch to the mask-decoding strategy selected in config.
+
+    config.ONESHOT_MASK_DECODING == True  → generate_smiles_oneshot (parallel,
+        one forward pass, conditionally-independent fills).
+    config.ONESHOT_MASK_DECODING == False → generate_smiles_sequential (default;
+        one mask at a time, dependency-aware).
+
+    All Stage-2 / 2.5 / 2.7 generation goes through here so the A/B switch is a
+    single config flag with no per-call-site changes.
+    """
+    if getattr(config, "ONESHOT_MASK_DECODING", False):
+        return generate_smiles_oneshot(
+            smiles_masked, tokenizer, model, device, **kwargs
+        )
+    return generate_smiles_sequential(
+        smiles_masked, tokenizer, model, device, **kwargs
+    )
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -428,7 +636,7 @@ def run_incremental_for_ligand(
         # ── Interaction-aware masked SMILES ───────────────────────────────────
         ia_masked = mask_atoms_in_smiles(smiles, ia_indices[:mask_count], tokenizer)
         ia_save   = os.path.join(lig_pred_dir, f"ia_mask{mask_count:03d}.txt")
-        ia_preds  = generate_smiles_sequential(
+        ia_preds  = generate_smiles(
             smiles_masked = ia_masked,
             tokenizer     = tokenizer,
             model         = model,
@@ -441,7 +649,7 @@ def run_incremental_for_ligand(
         # ── Random masked SMILES ──────────────────────────────────────────────
         rand_masked = mask_atoms_in_smiles(smiles, rand_indices[:mask_count], tokenizer)
         rand_save   = os.path.join(lig_pred_dir, f"rand_mask{mask_count:03d}.txt")
-        rand_preds  = generate_smiles_sequential(
+        rand_preds  = generate_smiles(
             smiles_masked = rand_masked,
             tokenizer     = tokenizer,
             model         = model,

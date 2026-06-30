@@ -83,6 +83,11 @@ BPE_MASK_ADAPTER_ENABLED  = False  # adapter over-masks (cascades on atom-mapped
 # ChemBERTa's native bare form (C, c, O) instead of bracketed [CH3], [cH].
 # Only applies when BPE_MASK_ADAPTER_ENABLED is False.
 CLEAN_SMILES_MASKING      = True
+# Token-level masking: tokenize the CLEAN SMILES first, then mask whole BPE
+# tokens that overlap the requested atoms (one <mask> per masked token).
+# Precedence when adapter is off: TOKEN_LEVEL_MASKING > CLEAN_SMILES_MASKING.
+# Set this True (and leave the adapter False) to use "tokenize-then-mask".
+TOKEN_LEVEL_MASKING       = False
 USE_STORED_MASKED_SMILES  = True   # Stage 1.9: read masked_smiles from JSON when indices match
 
 # ── Stage 1.5: random masking knobs ───────────────────────────────────────────
@@ -101,6 +106,26 @@ MAX_GRID_MOLS = 99  # Assumption A3
 INCREMENTAL_NUM_SAMPLES = 500
 TOP_K                   = 20
 TEMPERATURE             = 1.5
+
+# ── Mask-decoding strategy (A/B switch) ───────────────────────────────────────
+# False (default): generate_smiles_sequential — fill <mask>s one at a time,
+#   re-running the model after each fill so every mask conditions on the tokens
+#   already chosen (N forward passes for N masks). Captures inter-mask
+#   dependencies → higher SMILES validity, slower.
+# True: generate_smiles_oneshot — ChemBERTa's native MLM mode. ONE forward pass
+#   predicts all <mask> positions simultaneously; each mask is sampled
+#   independently from that single pass (conditionally independent, no
+#   cross-mask awareness). Much faster, but usually lower validity/uniqueness as
+#   the number of masks grows. Use to A/B against the sequential decoder.
+ONESHOT_MASK_DECODING   = False
+
+# When True, Stage 2.5 / 2.7 print per-mask_count sampling diagnostics to stdout:
+#   • sample_draws     — candidate completions attempted (should == num_samples
+#                        per freshly generated strategy cell)
+#   • rdkit_validate   — Chem.MolFromSmiles calls on finished candidates
+#                        (should == sample_draws per cell; no partial-string
+#                        RDKit checks — those use a lightweight regex pass)
+GENERATION_COUNT_DEBUG  = False
 
 # ── Stage 2 (legacy full-mask knobs, kept for backward compatibility) ──────────
 N_RANDOM_MASKED       = 20

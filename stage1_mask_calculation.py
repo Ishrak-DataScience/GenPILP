@@ -443,6 +443,10 @@ def _clean_masking_enabled() -> bool:
     return bool(getattr(config, "CLEAN_SMILES_MASKING", False))
 
 
+def _token_level_masking_enabled() -> bool:
+    return bool(getattr(config, "TOKEN_LEVEL_MASKING", False))
+
+
 def _smiles_output_atom_order(mol: Chem.Mol) -> List[int]:
     """RDKit atom indices in the order they appear in MolToSmiles output."""
     prop = "_smilesAtomOutputOrder"
@@ -532,6 +536,69 @@ def mask_atoms_in_smiles_clean(smiles: str,
     return "".join(parts)
 
 
+def mask_atoms_in_smiles_token_level(smiles: str,
+                                     atom_indices_to_mask: Iterable[int],
+                                     tokenizer,
+                                     ) -> str:
+    """
+    "Tokenize first, then mask at the token level."
+
+    The CLEAN (unmapped) SMILES is tokenized with the ChemBERTa BPE tokenizer
+    first; then every BPE token whose character span overlaps a requested atom
+    is replaced by one tokenizer.mask_token. Masking therefore happens at
+    ChemBERTa's native granularity: one <mask> per masked BPE token, and a
+    token that covers several atoms is masked as a single unit.
+
+    This differs from the disabled BPE adapter in two safe ways:
+      • it tokenizes the clean SMILES (no ':1' atom-map numbers), so tokens
+        stay in-distribution instead of shattering, and
+      • it does a single pass (atom -> covering token), with no iterative
+        neighbour expansion, so it cannot cascade into over-masking.
+
+    Requires a fast tokenizer (offset mapping). Raises on any inconsistency;
+    callers fall back to clean / legacy masking.
+    """
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError(f"Invalid SMILES: {smiles}")
+
+    mask_token = tokenizer.mask_token
+    mask_set   = {int(i) for i in atom_indices_to_mask}
+
+    clean = Chem.MolToSmiles(mol, canonical=True)
+    order = _smiles_output_atom_order(mol)
+    spans = _clean_smiles_atom_spans(clean)
+
+    if len(spans) != len(order):
+        raise ValueError(
+            f"Atom-span count ({len(spans)}) != atom count ({len(order)}) "
+            f"for SMILES {clean!r}"
+        )
+
+    idx_to_span = {order[k]: spans[k] for k in range(len(order))}
+    masked_atom_spans = [idx_to_span[i] for i in mask_set if i in idx_to_span]
+    if not masked_atom_spans:
+        return clean
+
+    enc = tokenizer(clean, return_offsets_mapping=True, add_special_tokens=False)
+    offsets = [(int(s), int(e)) for s, e in enc["offset_mapping"] if int(s) < int(e)]
+    if not offsets:
+        raise ValueError("Tokenizer returned no offsets (slow tokenizer?).")
+
+    def _overlaps(ts: int, te: int) -> bool:
+        return any(ts < e and te > b for (b, e) in masked_atom_spans)
+
+    parts: List[str] = []
+    pos = 0
+    for ts, te in offsets:
+        if ts > pos:                       # preserve any chars between tokens
+            parts.append(clean[pos:ts])
+        parts.append(mask_token if _overlaps(ts, te) else clean[ts:te])
+        pos = te
+    parts.append(clean[pos:])
+    return "".join(parts)
+
+
 def mask_atoms_in_smiles(smiles: str,
                          atom_indices_to_mask: Iterable[int],
                          tokenizer,
@@ -554,6 +621,16 @@ def mask_atoms_in_smiles(smiles: str,
             smiles, atom_indices_to_mask, tokenizer=tokenizer,
         )
         return result.masked_string
+
+    # Token-level masking: tokenize the clean SMILES first, then mask whole
+    # BPE tokens (takes precedence over clean masking when both are enabled).
+    if _token_level_masking_enabled():
+        try:
+            return mask_atoms_in_smiles_token_level(
+                smiles, atom_indices_to_mask, tokenizer,
+            )
+        except Exception:
+            pass   # fall through to clean / legacy on any failure
 
     # Clean masking: bare atoms everywhere except the masked positions.
     if _clean_masking_enabled():
