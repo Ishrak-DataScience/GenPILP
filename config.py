@@ -5,10 +5,25 @@ py  ─  Shareduration for all pipeline stages.
 ▶ Edit BASE_DIR and USER_PREFIX, then all output paths update automatically.
 """
 
+# Windows' console defaults to the cp1252 codepage, which can't encode the
+# emoji used in this pipeline's print() calls (🚀 ✅ ⚠️ ...) and crashes with
+# UnicodeEncodeError. Force UTF-8 on stdout/stderr here — the one module
+# every stage script imports — so every stage is fixed at once. No-op on
+# Colab/Linux, where stdout is already UTF-8.
+import sys as _sys
+if _sys.platform == "win32":
+    for _stream in (_sys.stdout, _sys.stderr):
+        _reconfigure = getattr(_stream, "reconfigure", None)
+        if _reconfigure is not None:
+            try:
+                _reconfigure(encoding="utf-8")
+            except Exception:
+                pass
+
 # ── Root directory ─────────────────────────────────────────────────────────────
 BASE_DIR    = "/content/drive/MyDrive/GenAI4Drug"
 USER_PREFIX = "Ishrak"
-EXPERIMENT_TAG = "expo09_fixed_BPE_tokenization"
+EXPERIMENT_TAG = "expo13_chemBertaZincv1_baseline"
 
 # ── All outputs live under BASE_DIR / USER_PREFIX / Output / <subdir> ────────── old
 #_OUT = f"{BASE_DIR}/{USER_PREFIX}/Output"
@@ -22,6 +37,7 @@ BASE_XML_PATH = f"{BASE_DIR}/Dummy_data/plip/"
 REF_CSV_PATH  = f"{BASE_DIR}/Dummy_data/BR4_PDB_Data.csv"
 
 # ── Output directories ─────────────────────────────────────────────────────────
+STAGE0A_DIR        = f"{_OUT}/stage0a_chembl_download/"  # Stage 0a  → ChEMBL download + verified SMILES
 MASK_CALC_OUTDIR   = f"{_OUT}/PLIP_Mask_Calculation/"    # Stage 1   → JSON files
 RANDOM_MASK_OUTDIR = f"{_OUT}/Random_Mask_Calculation/"  # Stage 1.5 → JSON files
 CHEMBL_MASK_OUTDIR = f"{_OUT}/ChEMBL_Mask_Calculation/"  # Stage 1.7 → ChEMBL random-mask JSONs
@@ -75,7 +91,10 @@ INCLUDE_TYPES = [
 ]
 
 # ── ChemBERTa model ────────────────────────────────────────────────────────────
-CHEMBERTA_MODEL = "seyonec/ChemBERTa-zinc-base-v1"
+# Option A: smaller, trained on 100k ZINC — original baseline
+# CHEMBERTA_MODEL = "seyonec/ChemBERTa-zinc-base-v1"
+# Option B: BPE on 10M PubChem SMILES, richer vocabulary, same <mask> token — recommended
+CHEMBERTA_MODEL = "seyonec/PubChem10M_SMILES_BPE_450k"
 # SELFIES ChemBERTa (BPE on SELFIES) — used by bpe_mask_adapter for Stage 1 SELFIES paths
 CHEMBERTA_SELFIES_MODEL = "seyonec/BPE_SELFIES_PubChem_shard00_166_5k"
 BPE_MASK_ADAPTER_ENABLED  = False  # adapter over-masks (cascades on atom-mapped SMILES); use 1-atom→1-<mask>
@@ -87,13 +106,25 @@ CLEAN_SMILES_MASKING      = True
 # tokens that overlap the requested atoms (one <mask> per masked token).
 # Precedence when adapter is off: TOKEN_LEVEL_MASKING > CLEAN_SMILES_MASKING.
 # Set this True (and leave the adapter False) to use "tokenize-then-mask".
-TOKEN_LEVEL_MASKING       = False
+TOKEN_LEVEL_MASKING       = True
 USE_STORED_MASKED_SMILES  = True   # Stage 1.9: read masked_smiles from JSON when indices match
 
 # ── Stage 1.5: random masking knobs ───────────────────────────────────────────
 RANDOM_MASK_SEED = 17
 # ── Stage 2.7: list of random seeds (each generates a full run, results aggregated) ──
 RANDOM_MASK_SEEDS_LIST = [17, 53, 89]
+
+# ── Stage 1a: ChEMBL token-level random masking + single-shot generation ─────
+STAGE1A_DIR           = f"{_OUT}/stage1a_random_token_masking/"  # one CSV per (percent, temperature, seed)
+STAGE1A_MASK_PERCENTS = [5, 10, 15, 20, 25]   # % of BPE tokens masked per SMILES (direct token-level masking)
+STAGE1A_TEMPERATURES  = [0.5,0.8,1.0, 1.2,1.5]   # ChemBERTa sampling temperatures
+# Cap on how many Stage-0a SMILES are processed per run — a random sample of
+# this size is drawn (reservoir sampling, one pass, seeded below) from the
+# full chembl_verified_smiles.csv so the subset is representative of the
+# whole file rather than just its first N rows. Set to None to process the
+# entire file (no sampling).
+STAGE1A_INPUT_LIMIT       = 2000
+STAGE1A_INPUT_SAMPLE_SEED = 42   # seed for the random sample above (reproducible across runs)
 
 # ────────────────────────────────────────────────────────────────────────────
 MAX_GRID_MOLS = 99  # Assumption A3

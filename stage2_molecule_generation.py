@@ -141,18 +141,37 @@ _SMILES_TOKEN_RE = _re.compile(
 # Per-tokenizer cache: tokenizer id → CPU bool tensor (vocab_size,)
 _SMILES_VOCAB_MASK_CACHE: dict = {}
 
+# temperature <= this is treated as literal greedy (argmax) decoding rather
+# than softmax(logits / temperature). Dividing by a near-zero epsilon (the
+# old `max(temperature, 1e-8)` approach) blows logits up to ~1e8-1e9x their
+# original scale; that is still finite in float32 but overflows to inf in
+# float16 (autocast/half-precision GPU inference), and softmax/multinomial
+# over an inf-containing tensor can yield NaN probabilities — which makes
+# torch.multinomial return an undefined/garbage token id, crashing the next
+# embedding lookup with a CUDA "index out of bounds" assert. Greedy argmax
+# is also just the conventional meaning of temperature=0 (deterministic,
+# no sampling), so this is a correctness fix as well as a stability one.
+_GREEDY_TEMPERATURE_THRESHOLD = 1e-4
 
-def _build_smiles_vocab_mask(tokenizer) -> "torch.Tensor":
+
+def _build_smiles_vocab_mask(tokenizer, model) -> "torch.Tensor":
     """
     Return a boolean CPU tensor of shape (vocab_size,) where True marks
-    tokens that are legal SMILES fragments.  Built once per tokenizer and
-    cached for the lifetime of the process.
+    tokens that are legal SMILES fragments.  Built once per (tokenizer, model)
+    pair and cached for the lifetime of the process.
+
+    vocab_size is taken from model.config.vocab_size (the actual width of the
+    logits tensor returned by the model), NOT tokenizer.vocab_size. Some
+    ChemBERTa checkpoints (e.g. seyonec/PubChem10M_SMILES_BPE_450k) keep the
+    default RoBERTa lm_head width (52000) even though their tokenizer only
+    uses a few thousand of those ids — masking with the tokenizer's smaller
+    vocab_size would crash on the width mismatch in masked_fill().
     """
-    key = id(tokenizer)
+    key = (id(tokenizer), id(model))
     if key in _SMILES_VOCAB_MASK_CACHE:
         return _SMILES_VOCAB_MASK_CACHE[key]
 
-    vocab_size = tokenizer.vocab_size or len(tokenizer.get_vocab())
+    vocab_size = getattr(model.config, "vocab_size", None) or tokenizer.vocab_size or len(tokenizer.get_vocab())
     mask = torch.zeros(vocab_size, dtype=torch.bool)
 
     # Always allow all special tokens (MASK, PAD, CLS, SEP, UNK, EOS, BOS)
@@ -367,7 +386,7 @@ def generate_smiles_sequential(
 
     # Build vocab mask once (cached after first call for this tokenizer)
     if rdkit_logit_filter:
-        vocab_mask = _build_smiles_vocab_mask(tokenizer).to(device)
+        vocab_mask = _build_smiles_vocab_mask(tokenizer, model).to(device)
 
     valid_set: set = set()
     invalid   = 0
@@ -379,7 +398,7 @@ def generate_smiles_sequential(
         for pos in mask_positions:
             out    = model(input_ids=ids.unsqueeze(0),
                            attention_mask=base_attn.unsqueeze(0))
-            logits = out.logits[0, pos] / max(temperature, 1e-8)
+            logits = out.logits[0, pos]  # temperature applied later, only if sampling (not greedy)
 
             if rdkit_logit_filter:
                 # ── Pass 1: zero non-SMILES tokens ──────────────────────────
@@ -402,17 +421,23 @@ def generate_smiles_sequential(
                     struct_ok = torch.ones(k, dtype=torch.bool, device=device)
 
                 filtered_logits = topk.values.masked_fill(~struct_ok, float("-inf"))
-                top_p  = torch.softmax(filtered_logits, dim=-1)
-                chosen = torch.multinomial(top_p, num_samples=1).item()
+                if temperature <= _GREEDY_TEMPERATURE_THRESHOLD:
+                    chosen = int(torch.argmax(filtered_logits).item())
+                else:
+                    top_p  = torch.softmax(filtered_logits / temperature, dim=-1)
+                    chosen = torch.multinomial(top_p, num_samples=1).item()
                 ids[pos] = topk.indices[chosen]
 
             else:
                 # Original unfiltered sampling
-                probs   = torch.softmax(logits, dim=-1)
-                topk    = torch.topk(probs, k=top_k)
-                top_p   = topk.values / topk.values.sum()
-                chosen  = torch.multinomial(top_p, num_samples=1).item()
-                ids[pos] = topk.indices[chosen]
+                if temperature <= _GREEDY_TEMPERATURE_THRESHOLD:
+                    ids[pos] = int(torch.argmax(logits).item())
+                else:
+                    probs   = torch.softmax(logits / temperature, dim=-1)
+                    topk    = torch.topk(probs, k=top_k)
+                    top_p   = topk.values / topk.values.sum()
+                    chosen  = torch.multinomial(top_p, num_samples=1).item()
+                    ids[pos] = topk.indices[chosen]
 
         cand = tokenizer.decode(ids, skip_special_tokens=True).replace(" ", "")
         if _rdkit_validate_smiles(cand) is not None:
@@ -483,7 +508,7 @@ def generate_smiles_oneshot(
         return []
 
     if rdkit_logit_filter:
-        vocab_mask = _build_smiles_vocab_mask(tokenizer).to(device)
+        vocab_mask = _build_smiles_vocab_mask(tokenizer, model).to(device)
 
     # ── Single forward pass: score every mask position simultaneously ─────────
     with torch.no_grad():
@@ -491,9 +516,14 @@ def generate_smiles_oneshot(
                     attention_mask=base_attn.unsqueeze(0))
 
     # Pre-compute the independent top-k distribution at each masked position.
+    # temperature is applied only in the softmax below (not to the raw
+    # logits) so a near-zero temperature can be routed to greedy argmax
+    # instead of overflowing softmax/multinomial — see
+    # _GREEDY_TEMPERATURE_THRESHOLD.
+    greedy = temperature <= _GREEDY_TEMPERATURE_THRESHOLD
     per_pos: List[tuple] = []
     for pos in mask_positions:
-        logits = out.logits[0, pos] / max(temperature, 1e-8)
+        logits = out.logits[0, pos]
         if rdkit_logit_filter:
             logits = logits.masked_fill(~vocab_mask, float("-inf"))
             k = min(top_k, int(vocab_mask.sum().item()), logits.shape[0])
@@ -501,7 +531,7 @@ def generate_smiles_oneshot(
             k = min(top_k, logits.shape[0])
         k = max(k, 1)
         topk  = torch.topk(logits, k=k)
-        probs = torch.softmax(topk.values, dim=-1)
+        probs = torch.softmax(topk.values, dim=-1) if not greedy else None
         per_pos.append((topk.indices, probs))
 
     valid_set: set = set()
@@ -511,7 +541,10 @@ def generate_smiles_oneshot(
         _record_sample_draw()
         ids = base_ids.clone()
         for (idxs, probs), pos in zip(per_pos, mask_positions):
-            chosen   = torch.multinomial(probs, num_samples=1).item()
+            if greedy:
+                chosen = 0  # topk is sorted descending — index 0 is the argmax
+            else:
+                chosen = torch.multinomial(probs, num_samples=1).item()
             ids[pos] = idxs[chosen]
 
         cand = tokenizer.decode(ids, skip_special_tokens=True).replace(" ", "")
