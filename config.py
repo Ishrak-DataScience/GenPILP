@@ -123,8 +123,18 @@ STAGE1A_TEMPERATURES  = [0.5,0.8,1.0, 1.2,1.5]   # ChemBERTa sampling temperatur
 # full chembl_verified_smiles.csv so the subset is representative of the
 # whole file rather than just its first N rows. Set to None to process the
 # entire file (no sampling).
-STAGE1A_INPUT_LIMIT       = 2000
+STAGE1A_INPUT_LIMIT       = 500
 STAGE1A_INPUT_SAMPLE_SEED = 42   # seed for the random sample above (reproducible across runs)
+
+# ── Stage 1a large-scale PLIP mask calculation ────────────────────────────────
+# Local PDB mirror: <PLIP_LARGE_SCALE_PDB_ROOT>/<mid2>/pdb<id>.ent.gz
+# (mid2 = chars[1:3] of the 4-char id, e.g. "100d" -> "00" -> .../00/pdb100d.ent.gz)
+PLIP_LARGE_SCALE_PDB_ROOT  = "/group/bioinf_tmp/Data/pdb"
+# Pre-computed PLIP XML reports, flat: <PLIP_LARGE_SCALE_XML_ROOT>/pdb<id>.xml
+PLIP_LARGE_SCALE_XML_ROOT  = "/group/bioinf_tmp/plip_pdb2xml"
+STAGE1A_PLIP_MASK_DIR      = f"{_OUT}/stage1a_large_scale_plip_mask/"
+STAGE1A_PLIP_SAMPLE_N      = 500   # default sample size (overridable via --n)
+STAGE1A_PLIP_SAMPLE_SEED   = 42    # default seed (overridable via --seed)
 
 # ────────────────────────────────────────────────────────────────────────────
 MAX_GRID_MOLS = 99  # Assumption A3
