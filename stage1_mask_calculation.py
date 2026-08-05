@@ -819,7 +819,16 @@ def generate_2d_interaction_plot(results: Dict[str, Any], output_path: str) -> N
     ax.set_xlim(0, canvas_size); ax.set_ylim(0, canvas_size); ax.axis("off")
     plt.title(f"2D Interaction Audit: {results['ligand']['resname']}",
               fontsize=16, fontweight="bold")
-    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+
+    savefig_kwargs: Dict[str, Any] = dict(dpi=300, bbox_inches="tight")
+    ext = os.path.splitext(output_path)[1].lower().lstrip(".")
+    if ext in ("jpg", "jpeg"):
+        # JPEG has no alpha channel; flatten onto white and set quality.
+        savefig_kwargs["facecolor"] = "white"
+        savefig_kwargs["pil_kwargs"] = {
+            "quality": getattr(config, "MASK_CALC_PLOT_QUALITY", 85)
+        }
+    plt.savefig(output_path, **savefig_kwargs)
     plt.close()
 
 
@@ -840,7 +849,8 @@ def run_pipeline(pdb_path: str,
                  mask_non_attractive: bool = False) -> Dict[str, Any]:
     """
     Full Stage-1 pipeline:
-        PDB + PLIP XML  →  meta dict  (+ optional .meta.json + .png)
+        PDB + PLIP XML  →  meta dict  (+ optional .meta.json + interaction plot,
+        see config.MASK_CALC_SAVE_PLOTS / MASK_CALC_PLOT_FORMAT / MASK_CALC_PLOT_DIR)
 
     The returned dict is the 'meta' object consumed by Stage 2.
     """
@@ -1019,9 +1029,17 @@ def run_pipeline(pdb_path: str,
             json.dump(meta, f, indent=2)
         print(f"  💾 JSON saved: {json_path}")
 
-        viz_path = os.path.splitext(out_prefix)[0] + ".2d_interactions.png"
-        generate_2d_interaction_plot(meta, viz_path)
-        print(f"  🖼  Plot saved: {viz_path}")
+        if getattr(config, "MASK_CALC_SAVE_PLOTS", True):
+            ext = getattr(config, "MASK_CALC_PLOT_FORMAT", "png").lower().lstrip(".")
+            plot_dir = getattr(config, "MASK_CALC_PLOT_DIR", None)
+            viz_name = os.path.basename(os.path.splitext(out_prefix)[0]) + f".2d_interactions.{ext}"
+            if plot_dir:
+                os.makedirs(plot_dir, exist_ok=True)
+                viz_path = os.path.join(plot_dir, viz_name)
+            else:
+                viz_path = os.path.splitext(out_prefix)[0] + f".2d_interactions.{ext}"
+            generate_2d_interaction_plot(meta, viz_path)
+            print(f"  🖼  Plot saved: {viz_path}")
 
     return meta
 

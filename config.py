@@ -136,6 +136,15 @@ STAGE1A_PLIP_MASK_DIR      = f"{_OUT}/stage1a_large_scale_plip_mask/"
 STAGE1A_PLIP_SAMPLE_N      = 500   # default sample size (overridable via --n)
 STAGE1A_PLIP_SAMPLE_SEED   = 42    # default seed (overridable via --seed)
 
+# ── Stage 1 / 1a: 2D interaction plot output (run_pipeline, shared) ──────────
+# Applies to every run_pipeline() call — stage1_mask_calculation.py's 5-ligand
+# main() as well as stage1a's large-scale batch — since the plot is generated
+# inside the shared run_pipeline() function whenever out_prefix is set.
+MASK_CALC_SAVE_PLOTS   = True     # False = skip 2D interaction plot generation entirely (saves disk + time)
+MASK_CALC_PLOT_FORMAT  = "png"    # "png" (lossless, larger) or "jpg" (lossy, ~5-10x smaller)
+MASK_CALC_PLOT_QUALITY = 85       # JPEG quality 1-95; only used when MASK_CALC_PLOT_FORMAT == "jpg"
+MASK_CALC_PLOT_DIR     = f"{_OUT}/mask_calculation_plots/"  # separate tree from the .meta.json output dir
+
 # ────────────────────────────────────────────────────────────────────────────
 MAX_GRID_MOLS = 99  # Assumption A3
 # ────────────────────────────────────────────────────────────────────────────
