@@ -13,9 +13,11 @@ __pycache__/
 *.egg-info/
 .ipynb_checkpoints/
 Dataset/
+Dataset/chembl_verified_smiles.csv
 
 # Editor / OS
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
+Dataset/chembl_verified_smiles.csv
