@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-stage1a_large_scale_PLIP_mask_calculation.py
+stage1b_large_scale_PLIP_mask_calculation.py
 ==============================================
 Large-scale batch version of stage1_mask_calculation.py's PLIP masking.
 
@@ -58,10 +58,10 @@ D6. stage1_mask_calculation.py itself is UNCHANGED — this script only
 HOW TO RUN
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     Standalone (interactive prompts for anything not passed):
-        python stage1a_large_scale_PLIP_mask_calculation.py
+        python stage1b_large_scale_PLIP_mask_calculation.py
 
     Batch (no prompts — every value supplied):
-        python stage1a_large_scale_PLIP_mask_calculation.py \\
+        python stage1b_large_scale_PLIP_mask_calculation.py \\
             --n 500 --seed 42 --mode 2 \\
             --pdb-root /group/bioinf_tmp/Data/pdb \\
             --xml-root /group/bioinf_tmp/plip_pdb2xml \\
@@ -69,7 +69,7 @@ HOW TO RUN
 
 HOW TO TEST (uses the pdb100d fixture already in Dataset/, no network mount needed)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    python stage1a_large_scale_PLIP_mask_calculation.py --test
+    python stage1b_large_scale_PLIP_mask_calculation.py --test
 """
 
 from __future__ import annotations
@@ -314,7 +314,7 @@ def run_large_scale_plip_masking(
             pdb_id, pdb_root, xml_root, output_dir, include_types, mask_non_attractive,
         ))
 
-    summary_path = os.path.join(output_dir, "stage1a_large_scale_plip_mask_summary.csv")
+    summary_path = os.path.join(output_dir, "stage1b_large_scale_plip_mask_summary.csv")
     with open(summary_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
         writer.writeheader()
@@ -385,16 +385,16 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[List[str]] = None) -> None:
     print("\n" + "=" * 60)
-    print("STAGE 1a: LARGE-SCALE PLIP MASK CALCULATION")
+    print("STAGE 1b: LARGE-SCALE PLIP MASK CALCULATION")
     print("=" * 60)
 
     args = _parse_args(argv)
 
     n = args.n if args.n is not None else _prompt_int(
-        "Sample size N", getattr(config, "STAGE1A_PLIP_SAMPLE_N", 500)
+        "Sample size N", getattr(config, "STAGE1B_PLIP_SAMPLE_N", 500)
     )
     seed = args.seed if args.seed is not None else _prompt_int(
-        "Random sample seed", getattr(config, "STAGE1A_PLIP_SAMPLE_SEED", 42)
+        "Random sample seed", getattr(config, "STAGE1B_PLIP_SAMPLE_SEED", 42)
     )
     pdb_root = args.pdb_root or _prompt_str(
         "PDB mirror root", config.PLIP_LARGE_SCALE_PDB_ROOT
@@ -403,7 +403,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         "PLIP XML root", config.PLIP_LARGE_SCALE_XML_ROOT
     )
     output_dir = args.output_dir or _prompt_str(
-        "Output directory", config.STAGE1A_PLIP_MASK_DIR
+        "Output directory", config.STAGE1B_PLIP_MASK_DIR
     )
     mask_non_attractive = (
         args.mode == "2" if args.mode is not None else _ask_mode()
@@ -429,7 +429,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         include_types=include_types,
     )
 
-    print("\n✅ Stage 1a large-scale PLIP masking complete.")
+    print("\n✅ Stage 1b large-scale PLIP masking complete.")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -471,7 +471,7 @@ def _run_self_test() -> None:
             assert row["pdb_id"] == "100d"
             assert row["status"] in ("ok", "error")
 
-    print("✅ Stage 1a large-scale PLIP masking self-test passed.")
+    print("✅ Stage 1b large-scale PLIP masking self-test passed.")
 
 
 if __name__ == "__main__":

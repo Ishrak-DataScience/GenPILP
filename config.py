@@ -21,9 +21,9 @@ if _sys.platform == "win32":
                 pass
 
 # ── Root directory ─────────────────────────────────────────────────────────────
-BASE_DIR    = "/content/drive/MyDrive/GenAI4Drug"
+BASE_DIR    = "/group/bioinf/Users/Ishrak/output2"  # root of the pipeline tree (all outputs live under this)
 USER_PREFIX = "Ishrak"
-EXPERIMENT_TAG = "expo13_chemBertaZincv1_baseline"
+EXPERIMENT_TAG = "expo7"
 
 # ── All outputs live under BASE_DIR / USER_PREFIX / Output / <subdir> ────────── old
 #_OUT = f"{BASE_DIR}/{USER_PREFIX}/Output"
@@ -126,21 +126,21 @@ STAGE1A_TEMPERATURES  = [0.5,0.8,1.0, 1.2,1.5]   # ChemBERTa sampling temperatur
 STAGE1A_INPUT_LIMIT       = 500
 STAGE1A_INPUT_SAMPLE_SEED = 42   # seed for the random sample above (reproducible across runs)
 
-# ── Stage 1a large-scale PLIP mask calculation ────────────────────────────────
+# ── Stage 1b large-scale PLIP mask calculation ────────────────────────────────
 # Local PDB mirror: <PLIP_LARGE_SCALE_PDB_ROOT>/<mid2>/pdb<id>.ent.gz
 # (mid2 = chars[1:3] of the 4-char id, e.g. "100d" -> "00" -> .../00/pdb100d.ent.gz)
 PLIP_LARGE_SCALE_PDB_ROOT  = "/group/bioinf_tmp/Data/pdb"
 # Pre-computed PLIP XML reports, flat: <PLIP_LARGE_SCALE_XML_ROOT>/pdb<id>.xml
 PLIP_LARGE_SCALE_XML_ROOT  = "/group/bioinf_tmp/plip_pdb2xml"
-STAGE1A_PLIP_MASK_DIR      = f"{_OUT}/stage1a_large_scale_plip_mask/"
-STAGE1A_PLIP_SAMPLE_N      = 500   # default sample size (overridable via --n)
-STAGE1A_PLIP_SAMPLE_SEED   = 42    # default seed (overridable via --seed)
+STAGE1B_PLIP_MASK_DIR      = f"{_OUT}/stage1b_large_scale_plip_mask/"
+STAGE1B_PLIP_SAMPLE_N      = 500   # default sample size (overridable via --n)
+STAGE1B_PLIP_SAMPLE_SEED   = 42    # default seed (overridable via --seed)
 
 # ── Stage 1 / 1a: 2D interaction plot output (run_pipeline, shared) ──────────
 # Applies to every run_pipeline() call — stage1_mask_calculation.py's 5-ligand
 # main() as well as stage1a's large-scale batch — since the plot is generated
 # inside the shared run_pipeline() function whenever out_prefix is set.
-MASK_CALC_SAVE_PLOTS   = True     # False = skip 2D interaction plot generation entirely (saves disk + time)
+MASK_CALC_SAVE_PLOTS   = False     # False = skip 2D interaction plot generation entirely (saves disk + time)
 MASK_CALC_PLOT_FORMAT  = "png"    # "png" (lossless, larger) or "jpg" (lossy, ~5-10x smaller)
 MASK_CALC_PLOT_QUALITY = 85       # JPEG quality 1-95; only used when MASK_CALC_PLOT_FORMAT == "jpg"
 MASK_CALC_PLOT_DIR     = f"{_OUT}/mask_calculation_plots/"  # separate tree from the .meta.json output dir
