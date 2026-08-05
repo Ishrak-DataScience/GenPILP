@@ -26,7 +26,7 @@ D1. Binding-site selection: NO filtering/heuristics are added beyond what
     <bindingsite> blocks per structure (e.g. pdb100d.xml has 3: two
     nucleotide copies + one spermine) — every one of them is masked, same
     as stage1_mask_calculation.py would if each were listed separately in
-    config.PIPELINE_INPUTS. No blocklist, no "largest ligand" heuristic.
+    config.PIPELINE_INPUTS. Ngit config --global http.postBuffer 524288000o blocklist, no "largest ligand" heuristic.
 
 D2. Sample size N = number of PDB/XML pairs sampled (not number of
     resulting masked rows) — each sampled structure contributes as many

@@ -92,9 +92,9 @@ INCLUDE_TYPES = [
 
 # ── ChemBERTa model ────────────────────────────────────────────────────────────
 # Option A: smaller, trained on 100k ZINC — original baseline
-# CHEMBERTA_MODEL = "seyonec/ChemBERTa-zinc-base-v1"
+CHEMBERTA_MODEL = "seyonec/ChemBERTa-zinc-base-v1"
 # Option B: BPE on 10M PubChem SMILES, richer vocabulary, same <mask> token — recommended
-CHEMBERTA_MODEL = "seyonec/PubChem10M_SMILES_BPE_450k"
+#CHEMBERTA_MODEL = "seyonec/PubChem10M_SMILES_BPE_450k"
 # SELFIES ChemBERTa (BPE on SELFIES) — used by bpe_mask_adapter for Stage 1 SELFIES paths
 CHEMBERTA_SELFIES_MODEL = "seyonec/BPE_SELFIES_PubChem_shard00_166_5k"
 BPE_MASK_ADAPTER_ENABLED  = False  # adapter over-masks (cascades on atom-mapped SMILES); use 1-atom→1-<mask>
