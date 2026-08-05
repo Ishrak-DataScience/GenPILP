@@ -65,6 +65,7 @@ STAGE7_DIR = f"{_OUT}/stage7_top_docked/"
 STAGE8_DIR         = f"{_OUT}/stage8_analysis/"               # Stage 8 scatter + Pareto top-10
 STAGE8_INPUT_CSV   = f"{_OUT}/stage6_docking/stage2/both/docking_summary.csv"  # override at prompt if absent
 RDKIT_POLICY_LORA_DIR = f"{_OUT}/stage2_policy_lora/"         # Stage 2 RDKit-policy LoRA adapter
+STAGE9_LORA_DIR       = f"{_OUT}/stage9_property_lora/"       # Stage 9 masked-data property-guided LoRA adapter
 
 
 # ── GNINA docking binary ───────────────────────────────────────────────────────

@@ -68,6 +68,21 @@ D7. Resume/checkpoint (needed once N can mean "all 220,000+ structures" —
     same args and it picks up where it left off. --no-resume forces a
     clean overwrite instead.
 
+D8. Multiprocessing: process_pdb_id() (decompress + parse + mask one PDB
+    ID) is CPU-bound and independent across PDB IDs, so it's dispatched
+    to a concurrent.futures.ProcessPoolExecutor — one OS process per
+    worker (sidesteps RDKit/matplotlib not being thread-parallel, and
+    isolates a hard crash on one structure to one worker). The MAIN
+    process remains the sole writer of the summary CSV (rows are written
+    + flushed as each worker's future completes via as_completed, in
+    completion order, not submission order) so there's no multi-writer
+    contention and the resume/checkpoint guarantee from D7 still holds.
+    --workers controls pool size; default is auto-detected from
+    $SLURM_CPUS_PER_TASK (falls back to os.sched_getaffinity, then
+    os.cpu_count()) — NOT bare os.cpu_count(), which reports the node's
+    total CPUs and would over-subscribe under a SLURM --cpus-per-task
+    allocation smaller than the node.
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 HOW TO RUN
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -84,9 +99,17 @@ HOW TO RUN
     Batch, ALL available PDB/XML pairs (skips ids missing either file;
     safe to re-run after a crash/interrupt — already-processed ids in
     --output-dir's summary CSV are skipped automatically, use --no-resume
-    to force a clean restart instead):
+    to force a clean restart instead), using every core SLURM gave this
+    task (--workers omitted => auto-detected from $SLURM_CPUS_PER_TASK):
         python stage1b_large_scale_PLIP_mask_calculation.py \\
             --sampling-mode all --mode 2 \\
+            --pdb-root /group/bioinf_tmp/Data/pdb \\
+            --xml-root /group/bioinf_tmp/plip_pdb2xml \\
+            --output-dir /path/to/output
+
+    Same, but capped at 8 worker processes instead of auto-detected:
+        python stage1b_large_scale_PLIP_mask_calculation.py \\
+            --sampling-mode all --mode 2 --workers 8 \\
             --pdb-root /group/bioinf_tmp/Data/pdb \\
             --xml-root /group/bioinf_tmp/plip_pdb2xml \\
             --output-dir /path/to/output
@@ -108,6 +131,7 @@ import random
 import re
 import shutil
 import tempfile
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 
 import config
@@ -127,6 +151,29 @@ CSV_FIELDS = [
 ]
 
 _XML_ID_RE = re.compile(r"^pdb(.+)\.xml$", re.IGNORECASE)
+
+
+def _default_worker_count() -> int:
+    """
+    Worker-process count to use when --workers isn't given (D8). Deliberately
+    NOT bare os.cpu_count(): under SLURM, that reports the whole node's CPU
+    count, not this job's --cpus-per-task allocation, and would over-subscribe.
+    Preference order: $SLURM_CPUS_PER_TASK -> sched_getaffinity (POSIX,
+    reflects cgroup/affinity limits) -> os.cpu_count() (e.g. Windows dev boxes).
+    """
+    slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
+    if slurm_cpus:
+        try:
+            return max(1, int(slurm_cpus))
+        except ValueError:
+            pass
+    sched_getaffinity = getattr(os, "sched_getaffinity", None)
+    if sched_getaffinity is not None:
+        try:
+            return max(1, len(sched_getaffinity(0)))
+        except OSError:
+            pass
+    return max(1, os.cpu_count() or 1)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -327,18 +374,21 @@ def run_large_scale_plip_masking(
     include_types: Optional[List[str]] = None,
     sampling_mode: str = "n",
     resume: bool = True,
+    workers: Optional[int] = None,
 ) -> str:
     """
     Select PDB IDs (either a random sample of size n, or — sampling_mode="all" —
     every available PDB/XML pair), mask every binding site PLIP found in each,
     and write one aggregated summary CSV. Returns the summary CSV path.
 
-    Rows are flushed to the summary CSV after each PDB ID (not buffered in
-    memory until the end) so a run over the full 220k+ dataset can be safely
-    interrupted. If resume=True and the summary CSV already exists, PDB IDs
-    already recorded in it are skipped (D2: skip already-processed ids, not
-    already-processed rows — process_pdb_id() writes all rows for an id in
-    one call, so "present in the CSV" implies "fully processed").
+    process_pdb_id() calls are dispatched across `workers` OS processes (D8);
+    the main process is the sole writer and flushes+fsyncs the summary CSV
+    after each PDB ID completes (in completion order, not submission order)
+    so a run over the full 220k+ dataset can be safely interrupted. If
+    resume=True and the summary CSV already exists, PDB IDs already recorded
+    in it are skipped (D2: skip already-processed ids, not already-processed
+    rows — process_pdb_id() writes all rows for an id in one call, so
+    "present in the CSV" implies "fully processed").
     """
     include_types = include_types or list(config.INCLUDE_TYPES)
     os.makedirs(output_dir, exist_ok=True)
@@ -368,17 +418,44 @@ def run_large_scale_plip_masking(
     file_exists_with_header = resume and os.path.isfile(summary_path) and bool(completed)
     file_mode = "a" if file_exists_with_header else "w"
 
-    with open(summary_path, file_mode, newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+    workers = workers if workers and workers > 0 else _default_worker_count()
+
+    if not picked:
+        print("  Nothing left to process (all picked ids already completed).")
         if file_mode == "w":
-            writer.writeheader()
-        for pdb_id in tqdm(picked, desc="Masking PDB structures", unit="pdb"):
-            rows = process_pdb_id(
-                pdb_id, pdb_root, xml_root, output_dir, include_types, mask_non_attractive,
-            )
-            writer.writerows(rows)
-            f.flush()
-            os.fsync(f.fileno())
+            with open(summary_path, file_mode, newline="", encoding="utf-8") as f:
+                csv.DictWriter(f, fieldnames=CSV_FIELDS).writeheader()
+    else:
+        print(f"  Workers: {workers} parallel process(es).")
+        with open(summary_path, file_mode, newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+            if file_mode == "w":
+                writer.writeheader()
+
+            with ProcessPoolExecutor(max_workers=workers) as executor:
+                futures = {
+                    executor.submit(
+                        process_pdb_id, pdb_id, pdb_root, xml_root, output_dir,
+                        include_types, mask_non_attractive,
+                    ): pdb_id
+                    for pdb_id in picked
+                }
+                try:
+                    for future in tqdm(as_completed(futures), total=len(futures),
+                                        desc="Masking PDB structures", unit="pdb"):
+                        pdb_id = futures[future]
+                        try:
+                            rows = future.result()
+                        except Exception as e:
+                            rows = [_error_row(pdb_id, "", None, None, mask_non_attractive, e)]
+                        writer.writerows(rows)
+                        f.flush()
+                        os.fsync(f.fileno())
+                except KeyboardInterrupt:
+                    print("\n  Interrupted — already-completed rows are saved; "
+                          "cancelling remaining pending work (rerun to resume)...")
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    raise
 
     with open(summary_path, newline="", encoding="utf-8") as f:
         all_rows = list(csv.DictReader(f))
@@ -465,6 +542,9 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                     help="Disable resume/checkpoint behavior — by default, PDB ids already "
                          "recorded in an existing summary CSV in --output-dir are skipped, "
                          "so an interrupted run can continue where it left off.")
+    p.add_argument("--workers", type=int, default=None,
+                    help="Number of parallel worker processes (default: auto-detected from "
+                         "$SLURM_CPUS_PER_TASK / CPU affinity — see D8).")
     p.add_argument("--test", action="store_true", help="Run the self-test and exit.")
     return p.parse_args(argv)
 
@@ -488,6 +568,9 @@ def main(argv: Optional[List[str]] = None) -> None:
         n = args.n if args.n is not None else 0
         seed = args.seed if args.seed is not None else getattr(config, "STAGE1B_PLIP_SAMPLE_SEED", 42)
     resume = getattr(config, "STAGE1B_RESUME", True) and not args.no_resume
+    workers = args.workers if args.workers is not None else _prompt_int(
+        "Number of parallel worker processes", _default_worker_count()
+    )
     pdb_root = args.pdb_root or _prompt_str(
         "PDB mirror root", config.PLIP_LARGE_SCALE_PDB_ROOT
     )
@@ -513,12 +596,14 @@ def main(argv: Optional[List[str]] = None) -> None:
   Masking mode     : {"NON-INTERACTION" if mask_non_attractive else "INTERACTION"}
   Include types    : {include_types}
   Resume           : {resume}
+  Workers          : {workers}
 """)
 
     run_large_scale_plip_masking(
         n=n, seed=seed, pdb_root=pdb_root, xml_root=xml_root,
         output_dir=output_dir, mask_non_attractive=mask_non_attractive,
         include_types=include_types, sampling_mode=sampling_mode, resume=resume,
+        workers=workers,
     )
 
     print("\n✅ Stage 1b large-scale PLIP masking complete.")
@@ -553,7 +638,7 @@ def _run_self_test() -> None:
         summary_path = run_large_scale_plip_masking(
             n=1, seed=0,
             pdb_root=fixture_pdb_root, xml_root=fixture_xml_root,
-            output_dir=td, mask_non_attractive=True,
+            output_dir=td, mask_non_attractive=True, workers=2,
         )
         assert os.path.isfile(summary_path)
         with open(summary_path, newline="", encoding="utf-8") as f:
