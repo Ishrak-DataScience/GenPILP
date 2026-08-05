@@ -67,6 +67,33 @@ STAGE8_INPUT_CSV   = f"{_OUT}/stage6_docking/stage2/both/docking_summary.csv"  #
 RDKIT_POLICY_LORA_DIR = f"{_OUT}/stage2_policy_lora/"         # Stage 2 RDKit-policy LoRA adapter
 STAGE9_LORA_DIR       = f"{_OUT}/stage9_property_lora/"       # Stage 9 masked-data property-guided LoRA adapter
 
+# ── Stage 9: composite score weights (all six terms configurable here) ────────
+# score = w_valid*valid + w_qed*QED + w_sa*(1-SA/10) + w_novelty*(1-similarity_to_original)
+#       + w_tox_alert*(1-PAINS/Brenk_alert) + w_tox21*(1-Tox21_classifier_toxic_prob)
+STAGE9_SCORE_W_VALID     = 0.20
+STAGE9_SCORE_W_QED       = 0.15
+STAGE9_SCORE_W_SA        = 0.10
+STAGE9_SCORE_W_NOVELTY   = 0.15
+STAGE9_SCORE_W_TOX_ALERT = 0.15   # PAINS/Brenk structural-alert filter (RDKit built-in, always available)
+STAGE9_SCORE_W_TOX21     = 0.25   # Tox21-classifier term (needs STAGE9_TOX21_MODEL_DIR below; contributes 0 if unset)
+
+# ── Stage 9: Tox21 toxicity classifier (second, independent toxicity term) ───
+# HuggingFace-style directory (AutoModelForSequenceClassification.from_pretrained
+# -loadable, num_labels=12, multi_label_classification) fine-tuned on Tox21.
+# Point this at your trained checkpoint; the term fails safe to 0 contribution
+# until this directory exists (same convention as the SA-Score optional import).
+STAGE9_TOX21_MODEL_DIR = ""   # TODO: set to your trained Tox21 ChemBERTa checkpoint directory
+# Canonical Tox21 task order — MUST match your checkpoint's classification-head
+# output order (this is DeepChem/MoleculeNet's standard load_tox21 task order).
+STAGE9_TOX21_ALL_TASKS = [
+    "NR-AR", "NR-AR-LBD", "NR-AhR", "NR-Aromatase", "NR-ER", "NR-ER-LBD",
+    "NR-PPAR-gamma", "SR-ARE", "SR-ATAD5", "SR-HSE", "SR-MMP", "SR-p53",
+]
+# Subset actually used when aggregating into the score (default: all 12; trim
+# this list to focus on e.g. just NR-* or SR-* tasks without touching code).
+STAGE9_TOX21_SELECTED_TASKS = list(STAGE9_TOX21_ALL_TASKS)
+STAGE9_TOX21_AGGREGATION    = "mean"   # "mean" or "max" across STAGE9_TOX21_SELECTED_TASKS
+
 
 # ── GNINA docking binary ───────────────────────────────────────────────────────
 # Stage 6 will auto-download if the binary is not found at this path.

@@ -38,20 +38,35 @@ non-differentiable RDKit computations.
 
 New terms vs. stage1_9's reward
 --------------------------------
-  novelty : 1 − Tanimoto(original_smiles, generated_smiles) on Morgan
-            fingerprints (r=2, 2048 bits) — same metric Stage 3 /
-            Stage 1.1a already use for "similarity to the parent
-            molecule", just inverted: HIGH similarity to the pre-mask
-            parent is now PENALISED (this is what makes fine-tuning push
-            the model to wander away from the original scaffold instead
-            of just reconstructing it), so novelty is rewarded instead.
-  tox     : 1 − toxicity_alert, where toxicity_alert = 1.0 if the
-            generated molecule matches any PAINS or Brenk structural
-            alert in RDKit's built-in FilterCatalog, else 0.0. This is a
-            filter-based toxicity/reactivity proxy — RDKit ships no
-            physiological toxicity predictor, so this is the accepted
-            cheminformatics stand-in (same alerts used for screening
-            assay interference / reactive/unstable groups).
+  novelty   : 1 − Tanimoto(original_smiles, generated_smiles) on Morgan
+              fingerprints (r=2, 2048 bits) — same metric Stage 3 /
+              Stage 1.1a already use for "similarity to the parent
+              molecule", just inverted: HIGH similarity to the pre-mask
+              parent is now PENALISED (this is what makes fine-tuning
+              push the model to wander away from the original scaffold
+              instead of just reconstructing it), so novelty is
+              rewarded instead.
+  tox_alert : 1 − alert, where alert = 1.0 if the generated molecule
+              matches any PAINS or Brenk structural alert in RDKit's
+              built-in FilterCatalog, else 0.0. A cheap, always-on
+              filter-based toxicity/reactivity proxy (no model to load,
+              no dependency beyond RDKit itself).
+  tox21     : 1 − mean/max(P_toxic) over config.STAGE9_TOX21_SELECTED_TASKS,
+              where P_toxic comes from a separately-trained Tox21
+              multi-label classifier (a HuggingFace
+              AutoModelForSequenceClassification checkpoint pointed to
+              by config.STAGE9_TOX21_MODEL_DIR, 12 sigmoid outputs — one
+              per Tox21 assay). This is a genuine LEARNED toxicity
+              signal (nuclear-receptor / stress-response assay
+              activation) layered on top of, not instead of, tox_alert
+              — resolved with the user as two independent weighted
+              terms (config.STAGE9_SCORE_W_TOX_ALERT and
+              config.STAGE9_SCORE_W_TOX21) rather than one blended
+              "tox" number, specifically so the cheap rule-based filter
+              keeps working even before a Tox21 checkpoint is trained.
+              Fails safe to 0 contribution (not 1 — do not silently
+              reward "unknown toxicity") whenever
+              config.STAGE9_TOX21_MODEL_DIR is unset or missing.
 
 Training data
 -------------
@@ -88,6 +103,7 @@ import torch
 from rdkit import Chem, RDLogger
 from rdkit.Chem import QED
 from rdkit.DataStructs import TanimotoSimilarity
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 RDLogger.DisableLog("rdApp.*")
 
@@ -136,6 +152,77 @@ def _get_toxicity_catalog():
     return _TOX_CATALOG
 
 
+# ── Optional: Tox21 multi-label toxicity classifier (second tox term) ──────
+# Fails safe (contributes 0, not 1) whenever config.STAGE9_TOX21_MODEL_DIR is
+# unset/missing — this is checked once at import time, not per-call, so a
+# missing checkpoint costs one warning instead of a warning per molecule.
+_TOX21_MODEL_DIR = getattr(config, "STAGE9_TOX21_MODEL_DIR", "") or ""
+_TOX21_AVAILABLE = bool(_TOX21_MODEL_DIR) and os.path.isdir(_TOX21_MODEL_DIR)
+if not _TOX21_AVAILABLE:
+    warnings.warn(
+        "config.STAGE9_TOX21_MODEL_DIR is unset or missing — the Tox21 "
+        "classifier term will contribute 0. Point it at your trained Tox21 "
+        "checkpoint directory to enable this term.",
+        stacklevel=1,
+    )
+
+_TOX21_MODEL     = None
+_TOX21_TOKENIZER = None
+_TOX21_DEVICE    = None
+
+
+def _load_tox21_classifier():
+    """Lazily load (once) the Tox21 classifier + tokenizer from STAGE9_TOX21_MODEL_DIR."""
+    global _TOX21_MODEL, _TOX21_TOKENIZER, _TOX21_DEVICE
+    if not _TOX21_AVAILABLE:
+        return None, None, None
+    if _TOX21_MODEL is not None:
+        return _TOX21_MODEL, _TOX21_TOKENIZER, _TOX21_DEVICE
+    try:
+        device    = "cuda" if torch.cuda.is_available() else "cpu"
+        tokenizer = AutoTokenizer.from_pretrained(_TOX21_MODEL_DIR)
+        model     = AutoModelForSequenceClassification.from_pretrained(_TOX21_MODEL_DIR)
+        model.to(device)
+        model.eval()
+        _TOX21_MODEL, _TOX21_TOKENIZER, _TOX21_DEVICE = model, tokenizer, device
+    except Exception as e:
+        warnings.warn(f"Failed to load Tox21 classifier from {_TOX21_MODEL_DIR}: {e}. "
+                       "The Tox21 term will contribute 0.", stacklevel=1)
+        _TOX21_MODEL = None
+    return _TOX21_MODEL, _TOX21_TOKENIZER, _TOX21_DEVICE
+
+
+def score_tox21(smiles: str) -> float:
+    """
+    "Clean" probability (1 - aggregated toxic probability) over
+    config.STAGE9_TOX21_SELECTED_TASKS, aggregated by
+    config.STAGE9_TOX21_AGGREGATION ("mean" or "max"). Returns 0.0
+    (fail-safe, not 1.0) whenever the classifier is unavailable or the
+    selected task names don't match STAGE9_TOX21_ALL_TASKS.
+    """
+    model, tokenizer, device = _load_tox21_classifier()
+    if model is None or tokenizer is None:
+        return 0.0
+
+    all_tasks = list(getattr(config, "STAGE9_TOX21_ALL_TASKS", []))
+    selected  = list(getattr(config, "STAGE9_TOX21_SELECTED_TASKS", all_tasks))
+    idxs = [all_tasks.index(t) for t in selected if t in all_tasks]
+    if not idxs:
+        return 0.0
+
+    try:
+        enc = tokenizer(smiles, return_tensors="pt", truncation=True, max_length=256).to(device)
+        with torch.no_grad():
+            logits = model(**enc).logits[0]
+        probs = torch.sigmoid(logits)[idxs]
+        aggregation = getattr(config, "STAGE9_TOX21_AGGREGATION", "mean")
+        toxic_prob = probs.max().item() if aggregation == "max" else probs.mean().item()
+    except Exception:
+        return 0.0
+
+    return float(min(max(1.0 - toxic_prob, 0.0), 1.0))
+
+
 # ════════════════════════════════════════════════════════════════════════════
 #  DEFAULT HYPER-PARAMETERS
 # ════════════════════════════════════════════════════════════════════════════
@@ -145,11 +232,14 @@ LORA_ALPHA       = 16
 LORA_DROPOUT     = 0.05
 LORA_TARGET_MODS = ["query", "value"]
 
-SCORE_W_VALID    = 0.25
-SCORE_W_QED      = 0.20
-SCORE_W_SA       = 0.15
-SCORE_W_NOVELTY  = 0.20
-SCORE_W_TOX      = 0.20
+# Score weights live in config.py (user-configurable), not here — see
+# config.STAGE9_SCORE_W_* for the six-term composite score.
+SCORE_W_VALID     = config.STAGE9_SCORE_W_VALID
+SCORE_W_QED       = config.STAGE9_SCORE_W_QED
+SCORE_W_SA        = config.STAGE9_SCORE_W_SA
+SCORE_W_NOVELTY   = config.STAGE9_SCORE_W_NOVELTY
+SCORE_W_TOX_ALERT = config.STAGE9_SCORE_W_TOX_ALERT
+SCORE_W_TOX21     = config.STAGE9_SCORE_W_TOX21
 
 BASELINE_DECAY   = 0.99
 TEMPERATURE      = 1.2
@@ -171,25 +261,30 @@ SAMPLE_SEED         = 42
 def compute_stage9_score(
     generated_smiles: str,
     original_smiles:  str,
-    weights: Tuple[float, float, float, float, float] = (
-        SCORE_W_VALID, SCORE_W_QED, SCORE_W_SA, SCORE_W_NOVELTY, SCORE_W_TOX),
+    weights: Tuple[float, float, float, float, float, float] = (
+        SCORE_W_VALID, SCORE_W_QED, SCORE_W_SA, SCORE_W_NOVELTY,
+        SCORE_W_TOX_ALERT, SCORE_W_TOX21),
 ) -> Tuple[float, Dict[str, float]]:
     """
     Composite score for one generated SMILES against the pre-mask parent.
 
-        score = w_valid  · valid
-              + w_qed    · QED
-              + w_sa     · (1 − SA/10)
-              + w_novelty· (1 − Tanimoto(original, generated))
-              + w_tox    · (1 − toxicity_alert)
+        score = w_valid     · valid
+              + w_qed       · QED
+              + w_sa        · (1 − SA/10)
+              + w_novelty   · (1 − Tanimoto(original, generated))
+              + w_tox_alert · (1 − PAINS/Brenk_alert)
+              + w_tox21     · (1 − Tox21_classifier_toxic_prob)
 
     Returns (score clamped to [0, 1], component dict for logging).
     Every component defaults to 0.0 (worst case) when it can't be computed
     (invalid molecule, missing optional dependency, etc.) — same
     fail-safe convention as stage1_9's compute_reward.
     """
-    w_valid, w_qed, w_sa, w_novelty, w_tox = weights
-    components = {"valid": 0.0, "qed": 0.0, "sa": 0.0, "novelty": 0.0, "tox": 0.0}
+    w_valid, w_qed, w_sa, w_novelty, w_tox_alert, w_tox21 = weights
+    components = {
+        "valid": 0.0, "qed": 0.0, "sa": 0.0, "novelty": 0.0,
+        "tox_alert": 0.0, "tox21": 0.0,
+    }
 
     mol = Chem.MolFromSmiles(generated_smiles)
     if mol is None:
@@ -218,16 +313,19 @@ def compute_stage9_score(
     if _TOX_AVAILABLE:
         try:
             has_alert = _get_toxicity_catalog().HasMatch(mol)
-            components["tox"] = 0.0 if has_alert else 1.0
+            components["tox_alert"] = 0.0 if has_alert else 1.0
         except Exception:
             pass
 
+    components["tox21"] = score_tox21(generated_smiles)
+
     score = (
-        w_valid   * components["valid"]
-        + w_qed   * components["qed"]
-        + w_sa    * components["sa"]
+        w_valid     * components["valid"]
+        + w_qed     * components["qed"]
+        + w_sa      * components["sa"]
         + w_novelty * components["novelty"]
-        + w_tox   * components["tox"]
+        + w_tox_alert * components["tox_alert"]
+        + w_tox21   * components["tox21"]
     )
     return float(min(max(score, 0.0), 1.0)), components
 
@@ -309,8 +407,9 @@ def run_stage9_finetuning(
     top_k:           int   = TOP_K,
     grad_clip:       float = GRAD_CLIP,
     baseline_decay:  float = BASELINE_DECAY,
-    score_weights:   Tuple[float, float, float, float, float] = (
-        SCORE_W_VALID, SCORE_W_QED, SCORE_W_SA, SCORE_W_NOVELTY, SCORE_W_TOX),
+    score_weights:   Tuple[float, float, float, float, float, float] = (
+        SCORE_W_VALID, SCORE_W_QED, SCORE_W_SA, SCORE_W_NOVELTY,
+        SCORE_W_TOX_ALERT, SCORE_W_TOX21),
 ) -> Dict[str, list]:
     """
     REINFORCE fine-tuning loop over (masked_smiles, original_smiles) pairs.
@@ -330,7 +429,7 @@ def run_stage9_finetuning(
     history: Dict[str, list] = {
         "epoch": [], "step": [], "reward_mean": [], "loss_mean": [],
         "valid_rate": [], "qed_mean": [], "sa_mean": [],
-        "novelty_mean": [], "tox_free_rate": [],
+        "novelty_mean": [], "tox_alert_free_rate": [], "tox21_clean_mean": [],
     }
     resume_adapter = None
 
@@ -386,7 +485,7 @@ def run_stage9_finetuning(
         batches = [pairs[i:i + batch_size] for i in range(0, len(pairs), batch_size)]
 
         ep_reward, ep_loss, ep_valid = [], [], []
-        ep_qed, ep_sa, ep_novelty, ep_tox_free = [], [], [], []
+        ep_qed, ep_sa, ep_novelty, ep_tox_free, ep_tox21 = [], [], [], [], []
 
         tqdm.write(f"\n{'─'*60}")
         tqdm.write(f"  Epoch {epoch}/{num_epochs}  ({len(batches)} batches × {batch_size} samples)")
@@ -394,8 +493,8 @@ def run_stage9_finetuning(
             "  What happens: model fills each <mask> token, samples a token\n"
             f"  from top-{top_k} candidates, records log P(token|context).\n"
             "  After all masks filled -> RDKit scores validity/QED/SA, plus\n"
-            "  novelty (1 - similarity to the pre-mask parent) and a\n"
-            "  PAINS/Brenk toxicity-alert check.\n"
+            "  novelty (1 - similarity to the pre-mask parent), a PAINS/Brenk\n"
+            "  toxicity-alert check, and (if configured) a Tox21 classifier probability.\n"
             f"  loss = -(score - {baseline:.3f}) x sum(log_prob)  <- this is what backward() sees."
         )
         tqdm.write(f"{'─'*60}")
@@ -403,7 +502,7 @@ def run_stage9_finetuning(
         for batch in batches:
             optimizer.zero_grad()
             batch_loss = torch.tensor(0.0, device=device)
-            b_reward = b_valid = b_qed = b_sa = b_novelty = b_tox_free = 0.0
+            b_reward = b_valid = b_qed = b_sa = b_novelty = b_tox_free = b_tox21 = 0.0
 
             for masked_smi, orig_smi in batch:
                 def _score_only(smi, _orig=orig_smi, _w=score_weights):
@@ -424,7 +523,8 @@ def run_stage9_finetuning(
                 b_qed      += comps["qed"]
                 b_sa       += comps["sa"]
                 b_novelty  += comps["novelty"]
-                b_tox_free += comps["tox"]
+                b_tox_free += comps["tox_alert"]
+                b_tox21    += comps["tox21"]
 
             n = max(len(batch), 1)
             batch_loss = batch_loss / n
@@ -443,13 +543,14 @@ def run_stage9_finetuning(
             ep_sa.append(b_sa / n)
             ep_novelty.append(b_novelty / n)
             ep_tox_free.append(b_tox_free / n)
+            ep_tox21.append(b_tox21 / n)
             global_step += 1
 
             pbar.set_postfix_str(
                 f"ep={epoch}/{num_epochs}  score={mean_reward:.3f}  "
                 f"loss={batch_loss.item():.4f}  valid={ep_valid[-1]:.0%}  "
                 f"novelty={ep_novelty[-1]:.2f}  tox_free={ep_tox_free[-1]:.0%}  "
-                f"baseline={baseline:.3f}",
+                f"tox21={ep_tox21[-1]:.2f}  baseline={baseline:.3f}",
                 refresh=True,
             )
             pbar.update(1)
@@ -462,7 +563,7 @@ def run_stage9_finetuning(
             f"loss={_avg(ep_loss):.4f}  valid={_avg(ep_valid):.1%}  "
             f"qed={_avg(ep_qed):.3f}  sa={_avg(ep_sa):.3f}  "
             f"novelty={_avg(ep_novelty):.3f}  tox_free={_avg(ep_tox_free):.1%}  "
-            f"baseline={baseline:.3f}"
+            f"tox21_clean={_avg(ep_tox21):.3f}  baseline={baseline:.3f}"
         )
 
         history["epoch"].append(epoch)
@@ -473,7 +574,8 @@ def run_stage9_finetuning(
         history["qed_mean"].append(_avg(ep_qed))
         history["sa_mean"].append(_avg(ep_sa))
         history["novelty_mean"].append(_avg(ep_novelty))
-        history["tox_free_rate"].append(_avg(ep_tox_free))
+        history["tox_alert_free_rate"].append(_avg(ep_tox_free))
+        history["tox21_clean_mean"].append(_avg(ep_tox21))
 
         epoch_adapter_dir = os.path.join(save_dir, f"epoch_{epoch:03d}")
         model.save_pretrained(epoch_adapter_dir)
@@ -500,7 +602,7 @@ def run_stage9_finetuning(
 def _plot_stage9_history(history: Dict[str, list], save_dir: str) -> None:
     if not history.get("epoch"):
         return
-    fig, axes = plt.subplots(2, 3, figsize=(16, 8))
+    fig, axes = plt.subplots(2, 4, figsize=(20, 8))
     ax = axes.flat
 
     ax[0].plot(history["epoch"], history["reward_mean"], marker="o", color="#1f77b4")
@@ -515,11 +617,17 @@ def _plot_stage9_history(history: Dict[str, list], save_dir: str) -> None:
     ax[3].plot(history["epoch"], history["qed_mean"], marker="d", color="#9467bd")
     ax[3].set_title("Mean QED / epoch"); ax[3].set_ylim(0, 1)
 
-    ax[4].plot(history["epoch"], history["novelty_mean"], marker="v", color="#ff7f0e")
-    ax[4].set_title("Mean novelty (1 - similarity to parent) / epoch"); ax[4].set_ylim(0, 1)
+    ax[4].plot(history["epoch"], history["sa_mean"], marker="X", color="#8c564b")
+    ax[4].set_title("Mean SA (1-normalised) / epoch"); ax[4].set_ylim(0, 1)
 
-    ax[5].plot(history["epoch"], history["tox_free_rate"], marker="P", color="#17becf")
-    ax[5].set_title("Toxicity-alert-free rate / epoch"); ax[5].set_ylim(0, 1)
+    ax[5].plot(history["epoch"], history["novelty_mean"], marker="v", color="#ff7f0e")
+    ax[5].set_title("Mean novelty (1 - similarity to parent) / epoch"); ax[5].set_ylim(0, 1)
+
+    ax[6].plot(history["epoch"], history["tox_alert_free_rate"], marker="P", color="#17becf")
+    ax[6].set_title("PAINS/Brenk alert-free rate / epoch"); ax[6].set_ylim(0, 1)
+
+    ax[7].plot(history["epoch"], history["tox21_clean_mean"], marker="*", color="#e377c2")
+    ax[7].set_title("Tox21 classifier clean prob. / epoch"); ax[7].set_ylim(0, 1)
 
     for a in ax:
         a.set_xlabel("Epoch"); a.grid(True, linestyle="--", alpha=0.4)
@@ -551,12 +659,15 @@ def main() -> None:
           recording log P(chosen_token | context) at each position.
        b. Decodes the full SMILES and scores it:
             score = {SCORE_W_VALID}*valid + {SCORE_W_QED}*QED + {SCORE_W_SA}*(1-SA/10)
-                  + {SCORE_W_NOVELTY}*(1-similarity_to_original) + {SCORE_W_TOX}*(1-toxicity_alert)
+                  + {SCORE_W_NOVELTY}*(1-similarity_to_original)
+                  + {SCORE_W_TOX_ALERT}*(1-PAINS/Brenk_alert) + {SCORE_W_TOX21}*(1-Tox21_toxic_prob)
        c. loss = -(score - baseline) * sum(log_prob)  -- backpropagated
           through the LoRA weights (REINFORCE / score-function estimator;
           see the module docstring for why this is required instead of
           plain backprop).
   4. Checkpoints after every epoch; safe to interrupt and resume.
+
+  Tox21 classifier : {"loaded from " + _TOX21_MODEL_DIR if _TOX21_AVAILABLE else "NOT configured (config.STAGE9_TOX21_MODEL_DIR) — tox21 term contributes 0"}
 """)
 
     pairs = collect_all_training_pairs()
@@ -570,10 +681,11 @@ def main() -> None:
     print("\n" + "=" * 60)
     print("  Stage 9 fine-tuning complete.")
     if history["valid_rate"]:
-        print(f"  Final validity rate : {history['valid_rate'][-1]:.1%}")
-        print(f"  Final mean score    : {history['reward_mean'][-1]:.3f}")
-        print(f"  Final novelty       : {history['novelty_mean'][-1]:.3f}")
-        print(f"  Final tox-free rate : {history['tox_free_rate'][-1]:.1%}")
+        print(f"  Final validity rate      : {history['valid_rate'][-1]:.1%}")
+        print(f"  Final mean score         : {history['reward_mean'][-1]:.3f}")
+        print(f"  Final novelty            : {history['novelty_mean'][-1]:.3f}")
+        print(f"  Final tox-alert-free rate: {history['tox_alert_free_rate'][-1]:.1%}")
+        print(f"  Final Tox21 clean prob.  : {history['tox21_clean_mean'][-1]:.3f}")
     print(f"  LoRA adapter         : {config.STAGE9_LORA_DIR}")
     print("=" * 60)
 
@@ -605,6 +717,8 @@ def _run_self_test() -> None:
     assert comps["valid"] == 1.0
     assert 0.0 <= score <= 1.0
     assert comps["novelty"] == 0.0, "Identical molecules must score zero novelty"
+    if not _TOX21_AVAILABLE:
+        assert comps["tox21"] == 0.0, "Tox21 term must fail safe to 0 when unconfigured"
 
     score_invalid, comps_invalid = compute_stage9_score("not_a_smiles(((", "CCO")
     assert score_invalid == 0.0
