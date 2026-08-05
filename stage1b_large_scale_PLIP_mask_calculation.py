@@ -8,9 +8,10 @@ stage1_mask_calculation.py processes a handful of hand-curated ligands
 (config.PIPELINE_INPUTS: 5 entries, each a manually specified
 {pdb_path, plip_xml_path, resname, chain, resseq}). This script does the
 same masking (same functions, unmodified: parse_plip_xml_v2_select,
-run_pipeline) but scales it up: it randomly samples N PDB IDs from a large
-local PDB mirror + a matching pre-computed PLIP-XML directory, and masks
-every binding site PLIP found in each sampled structure.
+run_pipeline) but scales it up: it selects PDB IDs (either a random sample
+of N, or every available id) from a large local PDB mirror + a matching
+pre-computed PLIP-XML directory, and masks every binding site PLIP found
+in each selected structure.
 
     Local PDB mirror   :  <pdb_root>/<mid2>/pdb<id>.ent.gz
                            (mid2 = id[1:3], e.g. "100d" -> "00")
@@ -26,11 +27,15 @@ D1. Binding-site selection: NO filtering/heuristics are added beyond what
     <bindingsite> blocks per structure (e.g. pdb100d.xml has 3: two
     nucleotide copies + one spermine) — every one of them is masked, same
     as stage1_mask_calculation.py would if each were listed separately in
-    config.PIPELINE_INPUTS. Ngit config --global http.postBuffer 524288000o blocklist, no "largest ligand" heuristic.
+    config.PIPELINE_INPUTS. No blocklist, no "largest ligand" heuristic.
 
 D2. Sample size N = number of PDB/XML pairs sampled (not number of
     resulting masked rows) — each sampled structure contributes as many
-    output rows as it has binding sites.
+    output rows as it has binding sites. Sampling mode "all" processes
+    every eligible PDB/XML pair instead of a random N of them (N/seed are
+    ignored); "eligible" already means present in BOTH the PDB mirror and
+    the PLIP XML directory (see discover_available_ids) — ids missing
+    either file are skipped automatically, same as in "n" mode.
 
 D3. Masking mode: identical prompt/default to stage1_mask_calculation.py's
     main() (mode 1 = INTERACTION masking by default, mode 2 =
@@ -44,15 +49,24 @@ D4. Per-ligand outputs: identical to stage1_mask_calculation.py —
     this script also writes ONE aggregated summary CSV across every
     sampled (pdb_id, resname, chain, resseq) row, successes and failures.
 
-D5. CLI args mirror every interactive prompt (--n, --seed, --pdb-root,
-    --xml-root, --output-dir, --mode, --include-types). Any argument
-    supplied on the command line skips its interactive prompt — so the
-    same script runs either as a batch job (all args passed, zero
-    prompts) or standalone (prompts for whatever wasn't passed), matching
-    every other stage script's convention.
+D5. CLI args mirror every interactive prompt (--sampling-mode, --n, --seed,
+    --pdb-root, --xml-root, --output-dir, --mode, --include-types).
+    Any argument supplied on the command line skips its interactive
+    prompt — so the same script runs either as a batch job (all args
+    passed, zero prompts) or standalone (prompts for whatever wasn't
+    passed), matching every other stage script's convention.
 
 D6. stage1_mask_calculation.py itself is UNCHANGED — this script only
     imports and reuses its functions.
+
+D7. Resume/checkpoint (needed once N can mean "all 220,000+ structures" —
+    a run that long will eventually get interrupted): summary CSV rows are
+    flushed + fsync'd to disk after every PDB ID, not buffered until the
+    end. By default (resume=True / no --no-resume), if the summary CSV in
+    --output-dir already exists, PDB ids already present in it are skipped
+    on restart, so a killed/crashed run can just be re-launched with the
+    same args and it picks up where it left off. --no-resume forces a
+    clean overwrite instead.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 HOW TO RUN
@@ -60,9 +74,19 @@ HOW TO RUN
     Standalone (interactive prompts for anything not passed):
         python stage1b_large_scale_PLIP_mask_calculation.py
 
-    Batch (no prompts — every value supplied):
+    Batch, fixed-size random sample (no prompts — every value supplied):
         python stage1b_large_scale_PLIP_mask_calculation.py \\
-            --n 500 --seed 42 --mode 2 \\
+            --sampling-mode n --n 500 --seed 42 --mode 2 \\
+            --pdb-root /group/bioinf_tmp/Data/pdb \\
+            --xml-root /group/bioinf_tmp/plip_pdb2xml \\
+            --output-dir /path/to/output
+
+    Batch, ALL available PDB/XML pairs (skips ids missing either file;
+    safe to re-run after a crash/interrupt — already-processed ids in
+    --output-dir's summary CSV are skipped automatically, use --no-resume
+    to force a clean restart instead):
+        python stage1b_large_scale_PLIP_mask_calculation.py \\
+            --sampling-mode all --mode 2 \\
             --pdb-root /group/bioinf_tmp/Data/pdb \\
             --xml-root /group/bioinf_tmp/plip_pdb2xml \\
             --output-dir /path/to/output
@@ -93,7 +117,7 @@ try:
     from tqdm import tqdm
 except ImportError:
     def tqdm(iterable=None, **kwargs):  # type: ignore[misc]
-        return iterable if iterable is not None else range(0)
+        return iterable if iterable is not None else []
 
 
 CSV_FIELDS = [
@@ -141,6 +165,15 @@ def sample_ids(available: List[str], n: int, seed: int) -> List[str]:
         return list(available)
     rng = random.Random(seed)
     return sorted(rng.sample(available, n))
+
+
+def _load_completed_ids(summary_path: str) -> set:
+    """PDB IDs already present in an existing summary CSV (used to resume a run)."""
+    if not os.path.isfile(summary_path):
+        return set()
+    with open(summary_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        return {row["pdb_id"] for row in reader if row.get("pdb_id")}
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -292,10 +325,20 @@ def run_large_scale_plip_masking(
     output_dir: str,
     mask_non_attractive: bool,
     include_types: Optional[List[str]] = None,
+    sampling_mode: str = "n",
+    resume: bool = True,
 ) -> str:
     """
-    Sample n PDB IDs, mask every binding site PLIP found in each, and write
-    one aggregated summary CSV. Returns the summary CSV path.
+    Select PDB IDs (either a random sample of size n, or — sampling_mode="all" —
+    every available PDB/XML pair), mask every binding site PLIP found in each,
+    and write one aggregated summary CSV. Returns the summary CSV path.
+
+    Rows are flushed to the summary CSV after each PDB ID (not buffered in
+    memory until the end) so a run over the full 220k+ dataset can be safely
+    interrupted. If resume=True and the summary CSV already exists, PDB IDs
+    already recorded in it are skipped (D2: skip already-processed ids, not
+    already-processed rows — process_pdb_id() writes all rows for an id in
+    one call, so "present in the CSV" implies "fully processed").
     """
     include_types = include_types or list(config.INCLUDE_TYPES)
     os.makedirs(output_dir, exist_ok=True)
@@ -305,23 +348,42 @@ def run_large_scale_plip_masking(
         raise RuntimeError(
             f"No PDB/XML pairs found (pdb_root={pdb_root}, xml_root={xml_root})."
         )
-    picked = sample_ids(available, n, seed)
-    print(f"  {len(available)} PDB/XML pairs available; sampled {len(picked)} (seed={seed}).")
 
-    all_rows: List[dict] = []
-    for pdb_id in tqdm(picked, desc="Masking PDB structures", unit="pdb"):
-        all_rows.extend(process_pdb_id(
-            pdb_id, pdb_root, xml_root, output_dir, include_types, mask_non_attractive,
-        ))
+    if sampling_mode == "all":
+        picked = list(available)
+        print(f"  ALL mode: {len(available)} PDB/XML pairs available (PDB or PLIP-missing ids already excluded).")
+    else:
+        picked = sample_ids(available, n, seed)
+        print(f"  {len(available)} PDB/XML pairs available; sampled {len(picked)} (seed={seed}).")
 
     summary_path = os.path.join(output_dir, "stage1b_large_scale_plip_mask_summary.csv")
-    with open(summary_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
-        writer.writeheader()
-        writer.writerows(all_rows)
 
+    completed: set = set()
+    if resume:
+        completed = _load_completed_ids(summary_path)
+        if completed:
+            before = len(picked)
+            picked = [pid for pid in picked if pid not in completed]
+            print(f"  Resume: {before - len(picked)} of {before} already in {summary_path} — skipping them.")
+    file_exists_with_header = resume and os.path.isfile(summary_path) and bool(completed)
+    file_mode = "a" if file_exists_with_header else "w"
+
+    with open(summary_path, file_mode, newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        if file_mode == "w":
+            writer.writeheader()
+        for pdb_id in tqdm(picked, desc="Masking PDB structures", unit="pdb"):
+            rows = process_pdb_id(
+                pdb_id, pdb_root, xml_root, output_dir, include_types, mask_non_attractive,
+            )
+            writer.writerows(rows)
+            f.flush()
+            os.fsync(f.fileno())
+
+    with open(summary_path, newline="", encoding="utf-8") as f:
+        all_rows = list(csv.DictReader(f))
     n_ok = sum(1 for r in all_rows if r["status"] == "ok")
-    print(f"  {n_ok}/{len(all_rows)} binding sites masked successfully.")
+    print(f"  {n_ok}/{len(all_rows)} binding sites masked successfully (cumulative across resumes).")
     print(f"  Summary CSV: {summary_path}")
     return summary_path
 
@@ -364,12 +426,32 @@ def _ask_mode() -> bool:
         print("    Please type 1 or 2.")
 
 
+def _ask_sampling_mode() -> str:
+    print("""
+  Sampling mode:
+    1 : Fixed sample size N, drawn at random             [default]
+    2 : ALL available PDB/XML pairs (skip ids missing a PDB or PLIP XML file)
+""")
+    while True:
+        raw = input("  Select sampling mode (1 / 2) [1]: ").strip()
+        if raw in ("", "1"):
+            return "n"
+        if raw == "2":
+            return "all"
+        print("    Please type 1 or 2.")
+
+
 def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Large-scale PLIP mask calculation over a random sample of PDB structures."
+        description="Large-scale PLIP mask calculation over a random sample "
+                     "(or all) of PDB structures."
     )
-    p.add_argument("--n", type=int, default=None, help="Number of PDB/XML pairs to sample.")
-    p.add_argument("--seed", type=int, default=None, help="Random sample seed.")
+    p.add_argument("--sampling-mode", type=str, choices=["n", "all"], default=None,
+                    help="'n' = sample --n PDB/XML pairs at random (default); "
+                         "'all' = process every available pair, skipping ids "
+                         "missing a PDB or PLIP XML file.")
+    p.add_argument("--n", type=int, default=None, help="Number of PDB/XML pairs to sample (--sampling-mode n).")
+    p.add_argument("--seed", type=int, default=None, help="Random sample seed (--sampling-mode n).")
     p.add_argument("--pdb-root", type=str, default=None,
                     help="Root of the local PDB mirror (<root>/<mid2>/pdb<id>.ent.gz).")
     p.add_argument("--xml-root", type=str, default=None,
@@ -379,6 +461,10 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                     help="1 = INTERACTION masking, 2 = NON-INTERACTION masking.")
     p.add_argument("--include-types", type=str, default=None,
                     help="Comma-separated PLIP interaction types (default: config.INCLUDE_TYPES).")
+    p.add_argument("--no-resume", action="store_true",
+                    help="Disable resume/checkpoint behavior — by default, PDB ids already "
+                         "recorded in an existing summary CSV in --output-dir are skipped, "
+                         "so an interrupted run can continue where it left off.")
     p.add_argument("--test", action="store_true", help="Run the self-test and exit.")
     return p.parse_args(argv)
 
@@ -390,12 +476,18 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     args = _parse_args(argv)
 
-    n = args.n if args.n is not None else _prompt_int(
-        "Sample size N", getattr(config, "STAGE1B_PLIP_SAMPLE_N", 500)
-    )
-    seed = args.seed if args.seed is not None else _prompt_int(
-        "Random sample seed", getattr(config, "STAGE1B_PLIP_SAMPLE_SEED", 42)
-    )
+    sampling_mode = args.sampling_mode or _ask_sampling_mode()
+    if sampling_mode == "n":
+        n = args.n if args.n is not None else _prompt_int(
+            "Sample size N", getattr(config, "STAGE1B_PLIP_SAMPLE_N", 500)
+        )
+        seed = args.seed if args.seed is not None else _prompt_int(
+            "Random sample seed", getattr(config, "STAGE1B_PLIP_SAMPLE_SEED", 42)
+        )
+    else:
+        n = args.n if args.n is not None else 0
+        seed = args.seed if args.seed is not None else getattr(config, "STAGE1B_PLIP_SAMPLE_SEED", 42)
+    resume = getattr(config, "STAGE1B_RESUME", True) and not args.no_resume
     pdb_root = args.pdb_root or _prompt_str(
         "PDB mirror root", config.PLIP_LARGE_SCALE_PDB_ROOT
     )
@@ -414,19 +506,19 @@ def main(argv: Optional[List[str]] = None) -> None:
     )
 
     print(f"""
-  N (sample size)  : {n}
-  Seed             : {seed}
+  Sampling mode    : {"ALL available PDB/XML pairs" if sampling_mode == "all" else f"N={n} (seed={seed})"}
   PDB root         : {pdb_root}
   XML root         : {xml_root}
   Output dir       : {output_dir}
   Masking mode     : {"NON-INTERACTION" if mask_non_attractive else "INTERACTION"}
   Include types    : {include_types}
+  Resume           : {resume}
 """)
 
     run_large_scale_plip_masking(
         n=n, seed=seed, pdb_root=pdb_root, xml_root=xml_root,
         output_dir=output_dir, mask_non_attractive=mask_non_attractive,
-        include_types=include_types,
+        include_types=include_types, sampling_mode=sampling_mode, resume=resume,
     )
 
     print("\n✅ Stage 1b large-scale PLIP masking complete.")
@@ -470,6 +562,40 @@ def _run_self_test() -> None:
         for row in rows:
             assert row["pdb_id"] == "100d"
             assert row["status"] in ("ok", "error")
+
+        # Resume (default): rerunning against the same output_dir must skip
+        # "100d" (already in the summary CSV) and leave it untouched (D7).
+        summary_path_resumed = run_large_scale_plip_masking(
+            n=1, seed=0,
+            pdb_root=fixture_pdb_root, xml_root=fixture_xml_root,
+            output_dir=td, mask_non_attractive=True, resume=True,
+        )
+        with open(summary_path_resumed, newline="", encoding="utf-8") as f:
+            rows_resumed = list(csv.DictReader(f))
+        assert rows_resumed == rows, "Resume should leave already-completed rows untouched"
+
+        # --no-resume equivalent (resume=False): must overwrite from scratch.
+        summary_path_fresh = run_large_scale_plip_masking(
+            n=1, seed=0,
+            pdb_root=fixture_pdb_root, xml_root=fixture_xml_root,
+            output_dir=td, mask_non_attractive=True, resume=False,
+        )
+        with open(summary_path_fresh, newline="", encoding="utf-8") as f:
+            rows_fresh = list(csv.DictReader(f))
+        assert len(rows_fresh) == 3, f"Expected 3 fresh rows after --no-resume, got {len(rows_fresh)}"
+
+    with tempfile.TemporaryDirectory() as td:
+        # sampling_mode="all": with only one eligible pair in the fixture dirs,
+        # this must behave the same as n=1 (D2).
+        summary_path_all = run_large_scale_plip_masking(
+            n=0, seed=0,
+            pdb_root=fixture_pdb_root, xml_root=fixture_xml_root,
+            output_dir=td, mask_non_attractive=True, sampling_mode="all",
+        )
+        with open(summary_path_all, newline="", encoding="utf-8") as f:
+            rows_all = list(csv.DictReader(f))
+        assert len(rows_all) == 3, f"Expected 3 rows in ALL mode, got {len(rows_all)}"
+        assert all(row["pdb_id"] == "100d" for row in rows_all)
 
     print("✅ Stage 1b large-scale PLIP masking self-test passed.")
 

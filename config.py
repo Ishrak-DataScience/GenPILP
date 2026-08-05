@@ -135,6 +135,10 @@ PLIP_LARGE_SCALE_XML_ROOT  = "/group/bioinf_tmp/plip_pdb2xml"
 STAGE1B_PLIP_MASK_DIR      = f"{_OUT}/stage1b_large_scale_plip_mask/"
 STAGE1B_PLIP_SAMPLE_N      = 500   # default sample size (overridable via --n)
 STAGE1B_PLIP_SAMPLE_SEED   = 42    # default seed (overridable via --seed)
+# "n"   : sample STAGE1B_PLIP_SAMPLE_N PDB/XML pairs at random (default)
+# "all" : process every PDB/XML pair available (skip ones missing PDB or PLIP XML)
+STAGE1B_SAMPLING_MODE      = "n"   # overridable via --sampling-mode {n,all}
+STAGE1B_RESUME             = True  # overridable via --no-resume; skip pdb_ids already in the summary CSV
 
 # ── Stage 1 / 1a: 2D interaction plot output (run_pipeline, shared) ──────────
 # Applies to every run_pipeline() call — stage1_mask_calculation.py's 5-ligand
