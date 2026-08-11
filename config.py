@@ -168,14 +168,37 @@ STAGE1B_PLIP_SAMPLE_SEED   = 42    # default seed (overridable via --seed)
 STAGE1B_SAMPLING_MODE      = "all"   # overridable via --sampling-mode {n,all}
 STAGE1B_RESUME             = True  # overridable via --no-resume; skip pdb_ids already in the summary CSV
 
+# ── Stage 1c: upload local PDB/PLIP pairs to Google Drive ────────────────────
+# Same eligibility rule as Stage 1b: only pdb_ids present as BOTH
+# <PLIP_LARGE_SCALE_PDB_ROOT>/<mid2>/pdb<id>.ent.gz and
+# <PLIP_LARGE_SCALE_XML_ROOT>/pdb<id>.xml are uploaded (as a pair).
+GDRIVE_UPLOAD_MODE       = "n"     # "n" = upload GDRIVE_UPLOAD_N random pairs; "all" = every eligible pair
+                                    # overridable via --upload-mode {n,all}
+GDRIVE_UPLOAD_N          = 50      # pairs to upload when GDRIVE_UPLOAD_MODE == "n"; overridable via --n
+GDRIVE_UPLOAD_SEED       = 42      # random sample seed; overridable via --seed
+GDRIVE_FOLDER_ID         = ""      # target Drive folder ID; "" = My Drive root; overridable via --folder-id
+# OAuth (installed-app) credentials — Google Cloud Console -> APIs & Services ->
+# Credentials -> "OAuth client ID" -> Desktop app -> download as JSON.
+# Used only if GDRIVE_SERVICE_ACCOUNT_FILE is unset/missing.
+GDRIVE_CREDENTIALS_FILE  = f"{BASE_DIR}/{USER_PREFIX}/gdrive_oauth_client.json"
+GDRIVE_TOKEN_FILE        = f"{BASE_DIR}/{USER_PREFIX}/gdrive_token.json"  # cached after first auth
+# Service-account credentials (Google Cloud Console -> IAM & Admin -> Service
+# Accounts -> Keys -> Create key -> JSON). Preferred on a headless server: no
+# browser needed. The target Drive folder (GDRIVE_FOLDER_ID) must be shared
+# with the service account's client_email, and — since service accounts have
+# no personal storage quota — that folder should live on a Shared Drive.
+GDRIVE_SERVICE_ACCOUNT_FILE = ""   # e.g. f"{BASE_DIR}/{USER_PREFIX}/gdrive_service_account.json"
+GDRIVE_UPLOAD_MANIFEST   = f"{_OUT}/stage1c_gdrive_upload/upload_manifest.csv"
+GDRIVE_UPLOAD_RESUME     = True    # overridable via --no-resume; skip pdb_ids already in the manifest CSV
+
 # ── Stage 1 / 1a: 2D interaction plot output (run_pipeline, shared) ──────────
 # Applies to every run_pipeline() call — stage1_mask_calculation.py's 5-ligand
 # main() as well as stage1a's large-scale batch — since the plot is generated
 # inside the shared run_pipeline() function whenever out_prefix is set.
-MASK_CALC_SAVE_PLOTS   = False     # False = skip 2D interaction plot generation entirely (saves disk + time)
+MASK_CALC_SAVE_PLOTS   = True     # False = skip 2D interaction plot generation entirely (saves disk + time)
 MASK_CALC_PLOT_FORMAT  = "png"    # "png" (lossless, larger) or "jpg" (lossy, ~5-10x smaller)
 MASK_CALC_PLOT_QUALITY = 85       # JPEG quality 1-95; only used when MASK_CALC_PLOT_FORMAT == "jpg"
-MASK_CALC_PLOT_DIR     = f"{_OUT}/mask_calculation_plots/"  # separate tree from the .meta.json output dir
+MASK_CALC_PLOT_DIR     = f"{_OUT}/mask_calculation_vis/"  # separate tree from the .meta.json output dir
 
 # ────────────────────────────────────────────────────────────────────────────
 MAX_GRID_MOLS = 99  # Assumption A3
