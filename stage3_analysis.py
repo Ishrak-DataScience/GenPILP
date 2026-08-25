@@ -300,13 +300,26 @@ def pool_smiles(
 #  FINGERPRINTS & SIMILARITY
 # ════════════════════════════════════════════════════════════════════════════
 
+# Built once, not once per call. Constructing a MorganGenerator costs ~0.27 ms
+# against ~0.06 ms for the fingerprint itself, so rebuilding it per molecule was
+# ~6x the real work -- and Stage 9 calls this twice per scored molecule.
+_MORGAN_GEN = None
+
+
+def _get_morgan_generator():
+    """The shared r=2 / 2048-bit Morgan generator, built on first use."""
+    global _MORGAN_GEN
+    if _MORGAN_GEN is None:
+        _MORGAN_GEN = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
+    return _MORGAN_GEN
+
+
 def _morgan_fp(smiles: str):
     """Return Morgan fingerprint (r=2, 2048 bits) or None if SMILES invalid."""
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         return None
-    gen = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
-    return gen.GetFingerprint(mol)
+    return _get_morgan_generator().GetFingerprint(mol)
 
 
 def pairwise_tanimoto(smiles_list: List[str]) -> List[float]:

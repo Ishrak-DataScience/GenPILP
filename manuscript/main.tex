@@ -1,0 +1,264 @@
+% ============================================================================
+% Stage 9 -- Methods subsection (Nature-style)
+% Property-guided reinforcement fine-tuning of ChemBERTa on interaction-
+% and randomly masked SMILES
+%
+% Drop this file into the Methods section of your Nature-format manuscript,
+% e.g. with \input{stage9_methods.tex}, and merge references.bib into your
+% bibliography resource (\bibliography{...,references}). Written against
+% natbib-style numeric \cite commands, which the standard Nature/Springer
+% Overleaf templates (sn-jnl, nature.cls with natbib) accept unmodified.
+% ============================================================================
+
+\subsection*{Property-guided reinforcement fine-tuning of the generative model}
+\label{sec:stage9}
+
+To bias the pretrained masked-language model towards generating valid,
+drug-like, synthetically accessible, scaffold-diverging and low-toxicity-risk
+molecules, we fine-tuned ChemBERTa~\cite{chithrananda2020chemberta} with a
+reinforcement-learning objective computed directly on chemistry-aware,
+\emph{post-hoc} scores of its own sampled outputs, rather than on a
+token-level cross-entropy target.
+
+\paragraph{Rationale for a policy-gradient objective.}
+The properties we wished to optimise -- RDKit-validity, drug-likeness (QED),
+synthetic accessibility, scaffold novelty relative to the parent ligand, and
+two independent toxicity-risk indicators -- can only be evaluated on the
+fully decoded, discrete SMILES string produced after every masked position
+has been filled and sampled tokens have been mapped back to characters. This
+decoding step is not differentiable, so no gradient can be back-propagated
+from a downstream cheminformatics score to the token logits by ordinary
+autodiff. We therefore treated masked-token infilling as a stochastic policy
+and used the REINFORCE (score-function) gradient
+estimator~\cite{williams1992reinforce,suttonbarto2018}: each sampled token's
+log-probability is retained with its computation graph intact, the finished
+molecule is scored by RDKit outside of autodiff, and a scalar loss is
+constructed from the \emph{log-probabilities} so that \texttt{loss.backward()}
+legitimately propagates a scoring signal into the trainable weights despite
+the intervening non-differentiable chemistry evaluation. The same device is
+standard for optimising sequence models against non-differentiable
+sequence-level metrics~\cite{ranzato2016mixer,rennie2017scst}.
+
+\paragraph{Parameter-efficient adaptation.}
+The ChemBERTa backbone (\texttt{ChemBERTa-zinc-base-v1}, pretrained by
+masked-language modelling on 77 million ZINC
+SMILES~\cite{chithrananda2020chemberta}) was kept frozen throughout, and
+trainable low-rank adaptation (LoRA) matrices~\cite{hu2022lora} were inserted
+into the query and value projections of every self-attention block (rank
+$r=8$, scaling $\alpha=16$, dropout $0.05$), leaving approximately 1\% of the
+model's parameters trainable. Adapters were implemented with the
+Hugging Face PEFT library~\cite{mangrulkar2022peft}.
+
+\paragraph{Training data.}
+Training pairs $(\tilde{s}, s)$ of a masked SMILES $\tilde{s}$ and its
+unmasked parent $s$ were drawn from two upstream sources and, unless noted
+otherwise, pooled: (i) molecules subjected to uniform random token-level
+masking (Stage 1a), and (ii) co-crystallised ligands from the Protein Data
+Bank masked at protein--ligand interaction sites identified by
+PLIP~\cite{salentin2015plip} (Stage 1b), where the candidate atom pool for
+masking was every interacting heavy atom on interaction-bearing residues
+(``attractive'' rows) or every non-interacting atom otherwise
+(``non-attractive'' rows). To hold the masking rate constant across sources,
+each Stage 1b pool was re-sampled, with a deterministic per-molecule seed, to
+$\lfloor p \times n_{\mathrm{tok}} \rfloor$ byte-pair-encoded (BPE) tokens
+($p=15\%$ of each molecule's tokens by default; the entire pool was masked
+when it contained fewer atoms than this target), and the masked SMILES was
+rebuilt from that subsample rather than from the full interaction pool.
+Stage 1a pairs were drawn only from the combination file already masked at
+the matching rate $p$. For the paired comparison reported below, the Stage 1a
+arm was constructed from the \emph{same} parent molecules as Stage 1b, masked
+at the same rate but at uniformly random token positions, so that the two arms
+differ only in \emph{which} tokens are masked --- interaction-derived versus
+random --- and not in the underlying molecule set.
+
+\paragraph{Evaluation-set redundancy control.}
+Stage 1b records one row per ligand \emph{instance}, keyed by (PDB entry,
+residue name, chain, residue number), so a ligand resolved in many deposited
+structures contributes many near-equivalent pairs. This redundancy was severe
+in practice: the 334{,}535 instance-level pairs surviving the masking step
+corresponded to only 41{,}474 distinct parent molecules (8.1 instances per
+molecule), and the twenty most frequently deposited species alone accounted for
+45.3\% of all instances --- led by sulfate (14.2\%) and glycerol (11.7\%), that
+is, crystallisation additives rather than ligands of interest. Because the
+frequently deposited species are also small, instance weighting distorted
+masking difficulty as well as chemical composition: mean parent length was 33.5
+BPE tokens instance-weighted against 60.3 tokens per distinct molecule, mean
+masked positions per attempt 4.44 against 8.15, and 40.0\% of instance-level
+attempts required only a single mask fill against 5.8\% of distinct molecules.
+We therefore deduplicated the evaluation set to one pair per unique parent,
+keyed on the canonical (RDKit) SMILES and retaining the first occurrence in a
+deterministic file order so that the pre- and post-fine-tuning comparisons are
+drawn over an identical molecule set; all reported property distributions are
+computed over distinct molecules. The effect is a reweighting rather than a
+change in model behaviour: baseline (non-fine-tuned) RDKit validity is 29.8\%
+(99{,}812/334{,}535) counting instances but 18.5\% (7{,}652/41{,}474) counting
+molecules, and an independent-fill model in which each of $m$ masked positions
+is completed correctly with probability $q$, calibrated to reproduce the
+instance-weighted value, predicts 10.0\% for the deduplicated mixture --- so
+the shift in masking-difficulty composition more than accounts for the observed
+change. The concurrent rise in mean QED (0.468 to 0.529) and synthetic
+accessibility score (3.02 to 3.49), and the fall in generations identical to
+their parent (15.7\% to 10.4\%), follow from the same reweighting.
+Deduplication was applied to the evaluation set only; the reinforcement-learning
+training pool remained instance-weighted.
+
+\paragraph{Rollout and sampling.}
+Masked positions were filled in a single, parallel decoding step rather than
+autoregressively. One forward pass over the fully masked input $\tilde{s}$
+produced logits at every \texttt{<mask>} position at once; each position was
+then sampled independently from that same pass, with logits divided by a
+temperature $T=1.2$ and the draw restricted to, and renormalised over, the
+top $k=20$ candidates. Masked positions are therefore \emph{conditionally
+independent} given the unmasked context $c(\tilde{s})$ --- no mask observes
+what any other mask sampled --- which is the native decoding behaviour of a
+masked language model and the same independence assumption made by
+non-autoregressive translation~\cite{gu2018nat} and by parallel decoding of
+conditional masked language models~\cite{ghazvininejad2019maskpredict}. The
+policy log-probability is accordingly the factorised sum
+\begin{equation}
+\log P_{\theta}(\tilde{s} \to \hat{s}) \;=\; \sum_{i \,\in\, \mathcal{M}} \log P_{\theta}\bigl(\hat{t}_i \mid c(\tilde{s})\bigr),
+\label{eq:stage9-logprob}
+\end{equation}
+over the set $\mathcal{M}$ of masked positions, and the filled sequence was
+decoded to a candidate SMILES $\hat{s}$. We note that
+Eq.~\eqref{eq:stage9-logprob} is a factorised approximation to the joint
+likelihood rather than the joint itself, since a masked language model does
+not define an explicit autoregressive factorisation over the filled
+positions~\cite{wang2019bertmouth}; the same one-shot procedure is used at
+training and at evaluation time, so no comparison in this work is confounded
+by a change of decoding strategy.
+
+\paragraph{Composite reward.}
+Each rollout was scored against its pre-mask parent $s$ by a six-term
+composite in $[0,1]$,
+\begin{align}
+\mathrm{score}(\hat{s}, s) \;=\;
+  &\,w_{\mathrm{valid}}\,\mathbb{1}[\hat{s}\ \mathrm{parses\ in\ RDKit}]
+  \;+\; w_{\mathrm{QED}}\,\mathrm{QED}(\hat{s})
+  \;+\; w_{\mathrm{SA}}\Bigl(1-\tfrac{\mathrm{SA}(\hat{s})}{10}\Bigr) \notag \\
+  &+\, w_{\mathrm{nov}}\bigl(1-T_{\mathrm{c}}(s,\hat{s})\bigr)
+  \;+\; w_{\mathrm{alert}}\bigl(1-\mathrm{alert}(\hat{s})\bigr)
+  \;+\; w_{\mathrm{tox21}}\bigl(1-\hat{p}_{\mathrm{tox21}}(\hat{s})\bigr),
+\label{eq:stage9-score}
+\end{align}
+where $\mathrm{QED}$ is the quantitative estimate of
+drug-likeness~\cite{bickerton2012qed}; $\mathrm{SA}\in[1,10]$ is the
+Ertl--Schuffenhauer synthetic accessibility
+score~\cite{ertl2009sascore}; $T_{\mathrm{c}}(s,\hat{s})$ is the Tanimoto
+coefficient between Morgan (ECFP-like) fingerprints of radius 2 and 2048 bits
+computed for the candidate and its pre-mask parent, so that
+$(1-T_{\mathrm{c}})$ rewards divergence from -- rather than reconstruction of
+-- the original scaffold~\cite{rogers2010ecfp}; $\mathrm{alert}(\hat{s})\in\{0,1\}$
+flags a match against RDKit's built-in PAINS~\cite{baell2010pains} and
+Brenk~\cite{brenk2008alerts} structural-alert catalogues, a lightweight,
+always-available reactivity/promiscuity filter; and
+$\hat{p}_{\mathrm{tox21}}(\hat{s})$ is the aggregated (mean, by default)
+sigmoid probability of toxicological activity across a subset of the twelve
+nuclear-receptor and stress-response assays of the Tox21
+panel~\cite{huang2016tox21,tox21challenge}, predicted by a separately
+fine-tuned ChemBERTa sequence-classification head. The two toxicity terms
+were kept independent rather than merged into a single value so that the
+rule-based filter continues to contribute even when no Tox21 classifier
+checkpoint is available, in which case $w_{\mathrm{tox21}}(1-\hat p_{\mathrm{tox21}})$
+is defined to contribute exactly zero (not the maximal value) to avoid
+implicitly rewarding unknown toxicity. Any component that cannot be computed
+(e.g.\ an invalid molecule) likewise defaults to its worst-case value of
+zero. Default weights were
+$(w_{\mathrm{valid}}, w_{\mathrm{QED}}, w_{\mathrm{SA}}, w_{\mathrm{nov}},
+w_{\mathrm{alert}}, w_{\mathrm{tox21}}) = (0.20, 0.15, 0.10, 0.15, 0.15,
+0.25)$.
+
+\paragraph{Anchoring to the pretrained distribution.}
+A score-maximising objective alone places no constraint on how far the policy
+may move from the chemistry ChemBERTa learned in pretraining, and unconstrained
+property optimisation is a well-documented route to degenerate, reward-hacked
+molecules~\cite{renz2019failure,gao2020synthesizability}. We therefore added a
+Kullback--Leibler control term against the frozen pretrained
+model~\cite{jaques2017sequencetutor,ziegler2019finetuning}. Because only the
+LoRA matrices are trainable, the reference policy $\pi_{\mathrm{ref}}$ is
+obtained by disabling the adapter at inference time, which recovers the
+pretrained weights exactly and requires neither a second copy of the model nor
+a separate checkpoint that could drift out of synchrony. At every masked
+position the exact KL divergence over the full vocabulary $V$ was computed
+analytically,
+\begin{equation}
+D_{\mathrm{KL}} \;=\; \sum_{i \,\in\, \mathcal{M}} \; \sum_{v \,\in\, V} \pi_{\theta}\bigl(v \mid c(\tilde{s})\bigr) \, \log \frac{\pi_{\theta}\bigl(v \mid c(\tilde{s})\bigr)}{\pi_{\mathrm{ref}}\bigl(v \mid c(\tilde{s})\bigr)},
+\label{eq:stage9-kl}
+\end{equation}
+rather than estimated from the sampled token, so that the anchor contributes
+no additional Monte-Carlo variance to an already high-variance gradient and is
+differentiable directly, without passing through the score-function estimator.
+Eq.~\eqref{eq:stage9-kl} is evaluated on the raw logits, deliberately not on
+the temperature-scaled and top-$k$-truncated distribution actually sampled
+from: the anchor is intended to constrain the \emph{model}, so that altering
+the sampling policy does not silently redefine what counts as drift. Two
+implementation details follow from the same requirement. The reference pass is
+evaluated deterministically, and dropout in the frozen backbone --- which
+regularises no trainable parameter --- was disabled during Stage 9 training,
+because a freshly initialised adapter is by construction identical to the
+reference (LoRA is initialised with $B=0$) yet, measured across stochastic
+forward passes, would otherwise register $0.1$--$0.3$ nats per position of
+apparent divergence that no weight update had caused. Dropout within the LoRA
+branch itself is retained.
+
+\paragraph{Optimisation.}
+The complete loss for a rollout was
+\begin{equation}
+\mathcal{L} \;=\; -\bigl(\mathrm{score}(\hat{s},s) - b\bigr)\,\log P_{\theta}(\tilde{s}\to\hat{s}) \;+\; \beta \, D_{\mathrm{KL}},
+\label{eq:stage9-loss}
+\end{equation}
+with $\beta = 0.05$ and using an exponential moving-average reward baseline $b$
+(decay $0.99$, updated from the mean score of each mini-batch) as a
+variance-reduction control variate~\cite{greensmith2004variance,mnih2014nvil},
+with $b$ initialised to zero. Setting $\beta=0$ recovers the unanchored
+objective. Per-example losses were averaged over mini-batches of 16 pairs, and
+adapter weights were updated with Adam~\cite{kingma2015adam} (learning rate
+$5\times10^{-5}$) after clipping the global gradient norm to 1.0. Training ran
+for 10 epochs over the pooled, shuffled Stage 1a/1b pairs, with the LoRA
+adapter, optimiser state and full training history checkpointed after every
+epoch to allow interruption and exact resumption. The mean KL per masked
+position was recorded each epoch alongside the reward components, providing a
+direct read-out of whether $\beta$ is holding the policy near its pretrained
+distribution.
+
+This overall strategy --- pretrain a generative model on a large SMILES
+corpus, then steer it towards desired properties with a policy-gradient
+objective --- follows established practice in de novo molecular
+design~\cite{segler2018focused,olivecrona2017reinvent,popova2018release,guimaraes2017organ,blaschke2020reinvent2},
+and REINFORCE specifically has been examined against alternative optimisers in
+this setting~\cite{neil2018exploring}. The formulation used here differs from
+those precedents in that the policy is a masked, non-autoregressive infilling
+model over a fixed scaffold of unmasked context rather than an autoregressive
+generator sampling molecules from scratch.
+
+% ------------------------------------------------------------------------
+% Optional hyperparameter summary table -- delete if the journal's Methods
+% word limit does not accommodate a table, or move it to the Supplementary
+% Information.
+% ------------------------------------------------------------------------
+\begin{table}[htbp]
+\centering
+\caption{Stage 9 default hyperparameters.}
+\label{tab:stage9-hparams}
+\begin{tabular}{@{}ll@{}}
+\toprule
+Parameter & Value \\
+\midrule
+Base model & ChemBERTa-zinc-base-v1~\cite{chithrananda2020chemberta} \\
+LoRA rank $r$ / $\alpha$ / dropout & 8 / 16 / 0.05 \\
+LoRA target modules & attention query, value projections \\
+Mask rate $p$ (\% of BPE tokens) & 15\% \\
+Decoding & one-shot (all masks in a single forward pass) \\
+Sampling top-$k$ / temperature $T$ & 20 / 1.2 \\
+KL anchor weight $\beta$ & 0.05 \\
+Reference policy $\pi_{\mathrm{ref}}$ & same model, LoRA adapter disabled \\
+Backbone dropout during Stage 9 & disabled (LoRA dropout retained) \\
+Batch size & 16 \\
+Optimiser / learning rate & Adam / $5\times10^{-5}$ \\
+Gradient-norm clip & 1.0 \\
+Baseline decay & 0.99 \\
+Epochs & 10 \\
+Reward weights $(w_{\mathrm{valid}}, w_{\mathrm{QED}}, w_{\mathrm{SA}}, w_{\mathrm{nov}}, w_{\mathrm{alert}}, w_{\mathrm{tox21}})$ & (0.20, 0.15, 0.10, 0.15, 0.15, 0.25) \\
+\bottomrule
+\end{tabular}
+\end{table}

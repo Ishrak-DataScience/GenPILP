@@ -1,0 +1,29 @@
+[project]
+name = "genplip"
+version = "0.1.0"
+description = "BRD4-GenAI: structure-aware molecular generation and docking pipeline (stage0a-stage9a)"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.0",
+    "transformers>=4.35",
+    "rdkit>=2023.9.1",
+    "selfies>=2.1",
+    "pandas>=2.0",
+    "numpy>=1.26",
+    "matplotlib>=3.7",
+    "tqdm>=4.65",
+    "peft>=0.11",
+    "torchao>=0.16.0",
+    "chembl-webresource-client>=0.10",
+]
+
+[project.optional-dependencies]
+# Only needed for stage1c_upload_pdb_plip_to_gdrive.py
+gdrive = [
+    "google-api-python-client>=2.0",
+    "google-auth-oauthlib>=1.0",
+    "google-auth-httplib2>=0.1",
+]
+
+[tool.uv]
+package = false

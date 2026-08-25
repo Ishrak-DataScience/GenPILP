@@ -560,14 +560,16 @@ def mask_atoms_in_smiles_token_level(smiles: str,
     """
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
-        raise ValueError(f"Invalid SMILES: {smiles}")
+        # Unsanitizable SMILES (e.g. hypervalent P/S from PDB bond perception):
+        # mask the input string as-is rather than dropping the molecule.
+        clean, order, spans = _unsanitized_atom_spans(smiles)
+    else:
+        clean = Chem.MolToSmiles(mol, canonical=True)
+        order = _smiles_output_atom_order(mol)
+        spans = _clean_smiles_atom_spans(clean)
 
     mask_token = tokenizer.mask_token
     mask_set   = {int(i) for i in atom_indices_to_mask}
-
-    clean = Chem.MolToSmiles(mol, canonical=True)
-    order = _smiles_output_atom_order(mol)
-    spans = _clean_smiles_atom_spans(clean)
 
     if len(spans) != len(order):
         raise ValueError(
@@ -596,6 +598,46 @@ def mask_atoms_in_smiles_token_level(smiles: str,
         parts.append(mask_token if _overlaps(ts, te) else clean[ts:te])
         pos = te
     parts.append(clean[pos:])
+    return "".join(parts)
+
+
+def mask_atoms_in_smiles_unsanitized(smiles: str,
+                                     atom_indices_to_mask: Iterable[int],
+                                     tokenizer,
+                                     ) -> str:
+    """
+    Mask atom indices in a SMILES string RDKit refuses to sanitize (e.g. the
+    hypervalent P/S groups that PDB-derived bond perception sometimes emits).
+
+    Works purely on the input string: RDKit numbers atoms in the order they
+    appear there, so atom index k is the k-th atom span of the raw SMILES.
+    A sanitize-free parse validates that correspondence before masking.
+
+    Raises ValueError if even the sanitize-free parse fails or the atom/span
+    counts disagree.
+    """
+    mol = Chem.MolFromSmiles(smiles, sanitize=False)
+    if mol is None:
+        raise ValueError(f"Unparsable SMILES: {smiles}")
+
+    spans = _clean_smiles_atom_spans(smiles)
+    if len(spans) != mol.GetNumAtoms():
+        raise ValueError(
+            f"Atom-span count ({len(spans)}) != atom count "
+            f"({mol.GetNumAtoms()}) for SMILES {smiles!r}"
+        )
+
+    mask_set   = {int(i) for i in atom_indices_to_mask}
+    mask_spans = sorted(spans[i] for i in mask_set if 0 <= i < len(spans))
+    if not mask_spans:
+        return smiles
+
+    parts, pos = [], 0
+    for start, end in mask_spans:
+        parts.append(smiles[pos:start])
+        parts.append(tokenizer.mask_token)
+        pos = end
+    parts.append(smiles[pos:])
     return "".join(parts)
 
 
@@ -643,7 +685,9 @@ def mask_atoms_in_smiles(smiles: str,
 
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
-        raise ValueError(f"Invalid SMILES: {smiles}")
+        return mask_atoms_in_smiles_unsanitized(
+            smiles, atom_indices_to_mask, tokenizer,
+        )
 
     mask_set   = set(atom_indices_to_mask)
     mask_token = tokenizer.mask_token

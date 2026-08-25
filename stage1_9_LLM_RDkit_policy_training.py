@@ -273,12 +273,26 @@ def load_chemberta_for_policy(
     lora_dropout:    float       = LORA_DROPOUT,
     lora_targets:    List[str]   = LORA_TARGET_MODS,
     lora_checkpoint: Optional[str] = None,
+    is_trainable:    bool          = True,
 ) -> Tuple[AutoTokenizer, torch.nn.Module, str]:
     """
     Load ChemBERTa and wrap it with LoRA adapters.
 
     If lora_checkpoint points to an existing directory the saved adapter
     is loaded from there (used when resuming training).
+
+    `is_trainable` is forwarded to PeftModel.from_pretrained and defaults to
+    True, which is what makes RESUME work at all. peft's own default is False:
+    it assumes a saved adapter is being loaded for inference and sets
+    requires_grad=False on every LoRA weight. A resuming caller then builds its
+    optimizer from `filter(lambda p: p.requires_grad, model.parameters())`,
+    gets an EMPTY list, and dies with "optimizer got an empty parameter list"
+    -- which is exactly what every resume of Stage 1.9 / Stage 9 / Stage 9.1
+    did before this argument existed.
+
+    Pass False only for a pure inference load. It costs nothing to leave True
+    there anyway: the evaluation paths run under torch.no_grad(), so no graph
+    is built whatever the flag says.
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tqdm.write(f"  Device : {device}")
@@ -291,8 +305,18 @@ def load_chemberta_for_policy(
 
     if _PEFT_AVAILABLE:
         if lora_checkpoint and os.path.isdir(lora_checkpoint):
-            model = PeftModel.from_pretrained(base_model, lora_checkpoint)
-            tqdm.write(f"  LoRA adapter loaded from : {lora_checkpoint}")
+            model = PeftModel.from_pretrained(
+                base_model, lora_checkpoint, is_trainable=is_trainable,
+            )
+            n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            tqdm.write(f"  LoRA adapter loaded from : {lora_checkpoint} "
+                       f"({n_train:,} trainable params)")
+            if is_trainable and n_train == 0:
+                raise RuntimeError(
+                    f"Adapter at {lora_checkpoint} loaded with zero trainable "
+                    f"parameters despite is_trainable=True -- training cannot "
+                    f"proceed. Check the peft version / adapter contents."
+                )
         else:
             lora_cfg = LoraConfig(
                 task_type      = TaskType.FEATURE_EXTRACTION,
