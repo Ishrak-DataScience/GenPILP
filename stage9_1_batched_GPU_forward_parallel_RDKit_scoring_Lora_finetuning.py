@@ -68,11 +68,49 @@ exactly that to assert Stage 9.1 reproduces Stage 9's rollout EXACTLY -- same
 SMILES, same log-probability -- which is what pins the gather/scatter/index_add
 bookkeeping end to end.
 
-Configuration
--------------
-  config.STAGE9_1_LORA_DIR          own output dir; never clobbers Stage 9's
-  config.STAGE9_1_BATCHED_ROLLOUT   "auto" (on when CUDA present) | True | False
-  config.STAGE9_1_SCORING_WORKERS   "auto" | N | 0/1 for serial
+Configuration -- you choose which speedups this run is allowed
+---------------------------------------------------------------
+Every hardware-tuned choice below is a config knob, and nothing is decided by
+the machine behind your back: the hardware profile is consulted only where you
+have written "auto". Precedence, highest first:
+
+    command-line flag  >  config.STAGE9_1_<KNOB>  >  config.STAGE9_1_SPEED
+
+  config.STAGE9_1_SPEED       the preset that fills in every knob left None
+      "off"    no speedups -- per-molecule rollout, serial scoring, fp32, no
+               TF32, no bucketing. The parity setting against Stage 9.
+      "safe"   only what cannot change which molecules get sampled or what the
+               objective is: the scoring pool, thread and pool tuning.
+      "fast"   the default, and what this file did before the knobs existed.
+      "auto"   alias of "fast".
+
+  Individually overridable (None = follow the preset):
+      _BATCHED_ROLLOUT  7a, one padded forward per batch   "auto"|True|False
+      _SCORING_WORKERS  7b, RDKit process pool             "auto"|N|0
+      _AMP              autocast dtype       "auto"|"bf16"|"fp16"|False
+      _GRAD_SCALER      fp16 loss scaling    "auto"|True|False  (+_INIT_SCALE)
+      _TF32             TF32 matmuls on Ampere+            True|False
+      _MATMUL_PRECISION float32 matmul precision
+                                     "auto"|"highest"|"high"|"medium"
+      _LENGTH_BUCKETING sort each epoch by token length    True|False
+      _TORCH_THREADS    intra-op threads here     "auto"|N|0 (leave alone)
+      _WORKER_BLAS_THREADS  threads inside each pool worker  "auto"|N
+      _POOL_START_METHOD    "auto"|"spawn"|"fork"|"forkserver"
+      _POOL_CHUNK_FACTOR    pool.map chunking divisor
+      _POOL_MAXTASKSPERCHILD  recycle workers after N tasks | None
+      _MAX_SEQ_TOKENS   rollout truncation ceiling
+      _TOX21_SUBBATCH   rows per Tox21 forward; 0 = whole batch
+      _DDP_SPLIT_BATCH  treat the batch size as global (True) or per rank
+      _DDP_FIND_UNUSED  DDP find_unused_parameters
+      _DDP_BACKEND      "auto"|"nccl"|"gloo"
+
+  Sizing (NOT part of the preset -- batch size is a learning knob here, since
+  it sets the optimizer-step count, and REINFORCE needs steps):
+      _BATCH_SIZE  int | "auto" (token budget) | "hardware" (auto-sized)
+      _MAX_BATCH_TOKENS, _MAX_BATCH_MOLECULES   "auto" mode budgets
+      _HW_MIN_TOTAL_STEPS, _HW_MAX_BATCH, _HW_MEM_HEADROOM  "hardware" mode
+
+  config.STAGE9_1_LORA_DIR    own output dir; never clobbers Stage 9's
 
 Every other knob -- score weights, mask percent, per-parent cap, epochs, KL
 beta, eval limit -- is Stage 9's, read from the same config entries.
@@ -81,6 +119,10 @@ Usage
 -----
   python "stage9_1_batched_GPU_forward_parallel_RDKit_scoring_Lora_finetuning.py"
   python "stage9_1_batched_GPU_forward_parallel_RDKit_scoring_Lora_finetuning.py" --test
+  ... --hardware          print the machine profile AND every knob's RESOLVED
+                          value, then exit. Run this first on a new box -- it
+                          is the only way to see what "auto" became there.
+  ... --speed off         override config.STAGE9_1_SPEED for this run
   ... --limit none        uncapped eval pass (match an uncapped Stage 9a baseline)
   ... --workers 0         force serial scoring
   ... --no-batch          force Stage 9's per-molecule rollout
@@ -134,6 +176,7 @@ from stage9_masked_property_finetune import (
     compose_stage9_score,
     compute_stage9_score,
     disable_base_dropout,
+    make_progress_reporter,
     reinforce_rollout_oneshot,
     run_property_distribution_eval,
     score_tox21_batch,
@@ -148,8 +191,9 @@ from stage1_9_LLM_RDkit_policy_training import (
 try:
     from tqdm import tqdm
 except ImportError:                                  # pragma: no cover
-    def tqdm(iterable=None, **kwargs):               # type: ignore[misc]
-        return iterable if iterable is not None else range(0)
+    # A silent stand-in with the same call surface, tqdm.write included;
+    # the old inline stub was a bare function and had no .write.
+    from tqdm_compat import tqdm  # type: ignore[misc]
 
 SCORE_WEIGHTS = (SCORE_W_VALID, SCORE_W_QED, SCORE_W_SA,
                  SCORE_W_NOVELTY, SCORE_W_TOX_ALERT, SCORE_W_TOX21)
@@ -158,42 +202,325 @@ MAX_MODEL_TOKENS = 512
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  RESOLVING THE TWO KNOBS
+#  HARDWARE CONTROL: ONE PRESET, AND A PER-KNOB OVERRIDE FOR EVERY SWITCH
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Every execution choice this file makes -- batching, pooling, precision,
+# threading, DDP, truncation -- is decided HERE and nowhere else, so a run is
+# fully described by config rather than by whatever machine it landed on.
+#
+# Three-level precedence, highest first:
+#
+#   1. an explicit argument (a CLI flag, or a keyword passed by a caller)
+#   2. an explicit config.STAGE9_1_<KNOB> that is not None
+#   3. config.STAGE9_1_SPEED, the preset, which supplies every knob left None
+#
+# CONFIG IS AUTHORITATIVE OVER hardware_autotune, not the other way round.
+# A knob may say "auto", and only then is the machine profile consulted. This
+# is a behavioural fix, not a refactor: hw.apply() used to switch TF32 on
+# unconditionally on cc>=8.0 hardware, AFTER which enable_tf32() would read
+# config.STAGE9_1_TF32=False, do nothing, and print "TF32 OFF" over kernels
+# that were in fact using it. Nothing here writes a backend setting that
+# config did not ask for.
+#
+# WHAT THE PRESETS MEAN
+#
+#   "off"   No speedup at all: Stage 9's per-molecule rollout, serial scoring,
+#           fp32, TF32 explicitly disabled, no bucketing. This is the parity
+#           setting -- the closest 9.1 can run to Stage 9, for when the point
+#           of the run is the comparison rather than the wall clock.
+#
+#   "safe"  Only speedups that cannot change WHICH molecules get sampled or
+#           what the objective is: the RDKit process pool (pinned by self-test
+#           [4]: pooled == serial to 1e-9), plus thread and pool tuning.
+#           Sampling order, batch composition and arithmetic precision all stay
+#           as in "off". The one honest caveat is that a different CPU thread
+#           count can reorder BLAS reductions, so a CPU-only run may differ in
+#           the last bits; on GPU it changes nothing.
+#
+#   "fast"  The default, and exactly what this file did before these knobs
+#           existed: batched rollout on GPU, pooled scoring, AMP, TF32, length
+#           bucketing. Distributionally identical to "off", not token-for-token
+#           identical -- see the reproducibility note in the module docstring.
+#
+#   "auto"  Alias of "fast". Every knob it leaves at "auto" is then sized by
+#           hardware_autotune (SLURM allocation, compute capability, ...).
+#
+# WHAT THE PRESET DELIBERATELY DOES NOT TOUCH
+#   STAGE9_1_BATCH_SIZE. Batch size is not a speed knob here, it is a LEARNING
+#   knob -- it sets the optimizer-step count, and REINFORCE needs steps. It
+#   would be dishonest for "fast" to quietly quarter the learning. See the note
+#   above STAGE9_1_BATCH_SIZE in config.py.
+
+_PRESET_KEYS = (
+    "batched_rollout", "scoring_workers", "amp", "tf32", "matmul_precision",
+    "torch_threads", "worker_blas_threads", "length_bucketing",
+    "pool_start_method", "pool_chunk_factor", "pool_maxtasksperchild",
+    "max_seq_tokens", "tox21_subbatch", "grad_scaler", "grad_scaler_init_scale",
+    "ddp_split_batch", "ddp_find_unused", "ddp_backend",
+    "hw_min_total_steps", "hw_max_batch", "hw_mem_headroom",
+)
+
+# Knobs that are NOT speedups, and so hold the same value at every level:
+#   worker_blas_threads / pool_*  shape the pool, which only exists when
+#                                 scoring_workers > 0 anyway
+#   max_seq_tokens                the model's window
+#   grad_scaler                   forced by the AMP dtype, not chosen for speed
+#   ddp_split_batch               a CORRECTNESS property (equal optimizer-step
+#                                 count across world sizes), not an optimisation
+#   hw_*                          only consulted when BATCH_SIZE == "hardware"
+_INVARIANT = {
+    "worker_blas_threads":    "auto",
+    "pool_start_method":      "auto",
+    "pool_chunk_factor":      2,
+    "pool_maxtasksperchild":  None,
+    "max_seq_tokens":         MAX_MODEL_TOKENS,
+    "grad_scaler":            "auto",
+    "grad_scaler_init_scale": None,
+    "ddp_split_batch":        True,
+    "ddp_find_unused":        False,
+    "ddp_backend":            "auto",
+    "hw_min_total_steps":     2000,
+    "hw_max_batch":           512,
+    "hw_mem_headroom":        0.55,
+}
+
+_SPEED_PRESETS: Dict[str, dict] = {
+    "off": dict(_INVARIANT,
+                batched_rollout=False, scoring_workers=0, amp=False,
+                tf32=False, matmul_precision="highest", torch_threads=0,
+                length_bucketing=False, tox21_subbatch=0),
+    "safe": dict(_INVARIANT,
+                 batched_rollout=False, scoring_workers="auto", amp=False,
+                 tf32=False, matmul_precision="highest", torch_threads="auto",
+                 length_bucketing=False, tox21_subbatch=0),
+    "fast": dict(_INVARIANT,
+                 batched_rollout="auto", scoring_workers="auto", amp="auto",
+                 tf32=True, matmul_precision="auto", torch_threads="auto",
+                 length_bucketing=True, tox21_subbatch=0),
+}
+_SPEED_PRESETS["auto"] = dict(_SPEED_PRESETS["fast"])
+
+# Set by --speed on the command line; overrides config.STAGE9_1_SPEED for this
+# process, so two presets can be A/B'd without editing config.
+_SPEED_OVERRIDE: Optional[str] = None
+
+
+def resolve_speed(name: str = None) -> str:
+    """
+    The active preset name.
+
+    An unknown name raises rather than falling back to "fast": a typo'd preset
+    that quietly runs every speedup is precisely the surprise these knobs exist
+    to remove.
+    """
+    if name is None:
+        name = _SPEED_OVERRIDE or getattr(config, "STAGE9_1_SPEED", "fast")
+    key = str(name).lower()
+    if key not in _SPEED_PRESETS:
+        raise ValueError(
+            f"config.STAGE9_1_SPEED={name!r} is not a preset. "
+            f"Choose one of {sorted(_SPEED_PRESETS)}."
+        )
+    return key
+
+
+def hw_setting(knob: str, override=None, speed: str = None):
+    """
+    Resolve one hardware knob through the three-level precedence above.
+
+    `override` is the caller's explicit value and wins outright; None means
+    "not specified", which is why every knob's OFF state is spelled False or 0
+    rather than None.
+    """
+    if knob not in _PRESET_KEYS:                     # pragma: no cover
+        raise KeyError(f"unknown hardware knob {knob!r}")
+    if override is not None:
+        return override
+    from_config = getattr(config, "STAGE9_1_" + knob.upper(), None)
+    if from_config is not None:
+        return from_config
+    return _SPEED_PRESETS[resolve_speed(speed)][knob]
+
+
+def _is_auto(v) -> bool:
+    return isinstance(v, str) and v.lower() == "auto"
+
+
+def describe_hardware_settings(speed: str = None) -> Dict[str, object]:
+    """
+    Every knob's RESOLVED value, for the banner and for the self-test.
+
+    Resolved, not configured: this is what the run will actually do, after
+    "auto" has been turned into a number by hardware_autotune. It is the answer
+    to "which speedups did I allow?", which a printout of config alone cannot
+    give.
+    """
+    return {
+        "speed":               resolve_speed(speed),
+        "batched_rollout":     resolve_batched(),
+        "scoring_workers":     resolve_workers(),
+        "amp":                 hw_setting("amp"),
+        "tf32":                bool(hw_setting("tf32")),
+        "matmul_precision":    hw_setting("matmul_precision"),
+        "torch_threads":       resolve_torch_threads(),
+        "worker_blas_threads": resolve_worker_blas_threads(),
+        "length_bucketing":    bool(hw_setting("length_bucketing")),
+        "pool_start_method":   resolve_pool_start_method(),
+        "pool_chunk_factor":   int(hw_setting("pool_chunk_factor")),
+        "max_seq_tokens":      resolve_max_seq_tokens(),
+        "tox21_subbatch":      resolve_tox21_subbatch(),
+        "grad_scaler":         hw_setting("grad_scaler"),
+        "ddp_split_batch":     bool(hw_setting("ddp_split_batch")),
+        "ddp_find_unused":     bool(hw_setting("ddp_find_unused")),
+        "ddp_backend":         hw_setting("ddp_backend"),
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  RESOLVING THE INDIVIDUAL KNOBS
 # ════════════════════════════════════════════════════════════════════════════
 
 def resolve_batched(setting=None) -> bool:
     """
-    config.STAGE9_1_BATCHED_ROLLOUT -> bool. "auto" means "on when CUDA is
+    STAGE9_1_BATCHED_ROLLOUT / preset -> bool. "auto" means "on when CUDA is
     present": batching mainly recovers per-launch overhead, which dominates a
     batch-1 forward on GPU and matters much less on CPU.
     """
-    if setting is None:
-        setting = getattr(config, "STAGE9_1_BATCHED_ROLLOUT", "auto")
-    if isinstance(setting, str) and setting.lower() == "auto":
+    setting = hw_setting("batched_rollout", setting)
+    if _is_auto(setting):
         return torch.cuda.is_available()
     return bool(setting)
 
 
 def resolve_workers(setting=None) -> int:
     """
-    config.STAGE9_1_SCORING_WORKERS -> worker count (0 = serial, no pool).
+    STAGE9_1_SCORING_WORKERS / preset -> worker count (0 = serial, no pool).
 
     "auto" leaves one core for this process (which still runs the model, the
-    tokenizer and the Tox21 batch) and caps at 8, past which RDKit scoring
+    tokenizer and the Tox21 batch) and caps at 16, past which RDKit scoring
     stops being the limiting factor. Returns 0 rather than 1 for a single
     worker: a one-worker pool is strictly slower than doing the work inline,
     since it adds pickling and IPC for no parallelism. This is the common case
     on a 2-vCPU Colab box -- measure there before trusting "auto".
     """
-    if setting is None:
-        setting = getattr(config, "STAGE9_1_SCORING_WORKERS", "auto")
-    if isinstance(setting, str) and setting.lower() == "auto":
+    setting = hw_setting("scoring_workers", setting)
+    if _is_auto(setting):
         # Defer to hardware_autotune, which reads the SLURM allocation / CPU
         # affinity / cgroup quota rather than os.cpu_count() -- on a shared HPC
         # node the host count is not what this job may use.
         setting = get_profile().cpu_workers
     n = int(setting)
     return 0 if n <= 1 else n
+
+
+def resolve_torch_threads(setting=None) -> int:
+    """
+    STAGE9_1_TORCH_THREADS / preset -> intra-op thread count for THIS process.
+
+    0 means "leave torch's own default alone", which is what "off" wants: not
+    touching a global is not the same as setting it to the value it already
+    held, and only the former survives a caller that set it deliberately.
+
+    Note the interaction with the scoring pool: this process and its W workers
+    share one CPU allocation, so on a small box the honest setting is FEWER
+    threads here, not more -- the parent spends most of the step waiting on the
+    GPU and on pool.map while the workers do the RDKit work.
+    """
+    setting = hw_setting("torch_threads", setting)
+    if _is_auto(setting):
+        return get_profile().torch_threads
+    return max(0, int(setting))
+
+
+def resolve_worker_blas_threads(setting=None) -> int:
+    """
+    STAGE9_1_WORKER_BLAS_THREADS / preset -> threads INSIDE each pool worker.
+
+    "auto" is 1. W workers each starting T BLAS threads on a W-core allocation
+    is the classic oversubscription that makes a pooled run slower than a
+    serial one; raise this only if you have deliberately left cores idle.
+    """
+    setting = hw_setting("worker_blas_threads", setting)
+    if _is_auto(setting):
+        return 1
+    return max(1, int(setting))
+
+
+def resolve_pool_start_method(setting=None) -> str:
+    """
+    STAGE9_1_POOL_START_METHOD / preset -> "spawn" | "fork" | "forkserver".
+
+    "auto" is "spawn", and that default is load-bearing rather than cautious:
+    fork copies this process's CUDA context into every child, which corrupts it
+    in ways that surface much later and elsewhere. "fork" is faster to start
+    (no re-import of the module tree) and is a legitimate choice on a CPU-only
+    Linux run; it is refused here on Windows, and downgraded with a warning
+    when CUDA has been initialised.
+
+    "forkserver" is NOT subject to that downgrade, because it does not fork
+    this process. Python starts a separate server interpreter (fork+exec, so it
+    inherits no CUDA context), that server imports the main module ONCE, and
+    every worker is forked from the server. On Colab that turns W re-imports of
+    torch + transformers into one -- the difference between ~25 s and ~20 s of
+    pool startup at W=2, and a much wider gap at W=7 -- while the parent's GPU
+    context stays untouched. It is the right setting for a Linux box with a
+    live CUDA context, which is exactly what Stage 10.1 has when it builds the
+    pool after loading the model.
+
+    One caveat comes with it: worker.init_worker pins OMP_NUM_THREADS, and
+    OpenMP reads that only when it initialises, i.e. on `import torch`. Under
+    forkserver torch is already imported in the server, so the env vars no
+    longer take and only the torch.set_num_threads(...) call in init_worker
+    does. Watch for thread oversubscription if you also raise
+    STAGE9_1_WORKER_BLAS_THREADS.
+    """
+    setting = hw_setting("pool_start_method", setting)
+    method = "spawn" if _is_auto(setting) else str(setting).lower()
+    available = mp.get_all_start_methods()
+    if method not in available:
+        warnings.warn(
+            f"start method {method!r} is unavailable on this platform "
+            f"(have {available}); falling back to 'spawn'.",
+            RuntimeWarning, stacklevel=2,
+        )
+        return "spawn"
+    if method == "fork" and torch.cuda.is_initialized():
+        warnings.warn(
+            f"config.STAGE9_1_POOL_START_METHOD={method!r} with an initialised "
+            f"CUDA context: forking copies that context into every worker and "
+            f"corrupts it. Using 'spawn' instead -- 'forkserver' gives most of "
+            f"fork's startup saving and is safe here.",
+            RuntimeWarning, stacklevel=2,
+        )
+        return "spawn"
+    return method
+
+
+def resolve_max_seq_tokens(setting=None) -> int:
+    """
+    STAGE9_1_MAX_SEQ_TOKENS / preset -> truncation length for the rollout.
+
+    A memory knob more than a speed one: the padded cost is B x L x V, so
+    halving L halves the logits tensor. Setting it below the longest pair in
+    the data silently truncates molecules, so reach for it only when a batch
+    genuinely will not fit.
+    """
+    return max(8, int(hw_setting("max_seq_tokens", setting)))
+
+
+def resolve_tox21_subbatch(setting=None) -> int:
+    """
+    STAGE9_1_TOX21_SUBBATCH / preset -> rows per Tox21 forward (0 = whole batch).
+
+    The Tox21 term is the one score component that stays on this process, and
+    it is evaluated as a single padded forward over the batch. At batch 512
+    with a 256-token window that forward is the largest single allocation in
+    the step and can exhaust a small card well before the rollout does.
+    Chunking it changes nothing numerically: the classifier is frozen and in
+    eval(), so no row's logits depend on any other row.
+    """
+    return max(0, int(hw_setting("tox21_subbatch", setting)))
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -212,7 +539,7 @@ def resolve_workers(setting=None) -> int:
 # ranks: per_rank = global // world_size. Step count is then IDENTICAL to a
 # single-GPU run and the speedup is real wall-clock. _shard_batches enforces it.
 
-def ddp_setup() -> Tuple[int, int, int, bool]:
+def ddp_setup(backend: str = None) -> Tuple[int, int, int, bool]:
     """
     Join the torchrun process group if we were launched under one.
 
@@ -240,6 +567,7 @@ def ddp_setup() -> Tuple[int, int, int, bool]:
             )
         return 0, 1, 0, False
 
+    global _PG_OWNED
     import torch.distributed as dist
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     local_ws   = int(os.environ.get("LOCAL_WORLD_SIZE",
@@ -259,19 +587,41 @@ def ddp_setup() -> Tuple[int, int, int, bool]:
             f"(gloo backend, which is how to test this on a 1-GPU box like Colab)."
         )
 
-    backend = "nccl" if n_gpu else "gloo"
+    backend = hw_setting("ddp_backend", backend)
+    if _is_auto(backend):
+        backend = "nccl" if n_gpu else "gloo"
+    backend = str(backend).lower()
+    if backend == "nccl" and not n_gpu:
+        # init_process_group would fail deep inside NCCL with a message that
+        # says nothing about the cause; say it here instead.
+        raise RuntimeError(
+            "config.STAGE9_1_DDP_BACKEND='nccl' but no CUDA device is visible. "
+            "nccl is GPU-only -- use 'gloo' (or 'auto') for a CPU run."
+        )
     if not dist.is_initialized():
         dist.init_process_group(backend=backend)
+        _PG_OWNED = True                 # we created it, so we may destroy it
     if n_gpu:
         torch.cuda.set_device(local_rank)
     return dist.get_rank(), dist.get_world_size(), local_rank, True
 
 
+# Whether THIS module initialised the process group. A caller that set the
+# group up itself (stage9_1_ddp_smoketest, or any driver script) still owns it
+# afterwards, and tearing down someone else's group is how you get a hang:
+# destroy_process_group() followed by a re-init on the same MASTER_PORT blocks,
+# because the rendezvous store from the first init is still bound.
+_PG_OWNED = False
+
+
 def ddp_cleanup(is_dist: bool) -> None:
-    if is_dist:
+    """Destroy the process group ONLY if ddp_setup created it."""
+    global _PG_OWNED
+    if is_dist and _PG_OWNED:
         import torch.distributed as dist
         if dist.is_initialized():
             dist.destroy_process_group()
+        _PG_OWNED = False
 
 
 def _all_reduce_mean(value: float, is_dist: bool, device: str) -> float:
@@ -306,16 +656,44 @@ def _shard_batches(batches: List[list], rank: int, world_size: int,
     return mine[:int(n.item())]
 
 
-def enable_tf32() -> bool:
-    """TF32 matmuls on Ampere+ (no-op on T4/Turing and CPU). Free throughput."""
-    if not getattr(config, "STAGE9_1_TF32", True) or not torch.cuda.is_available():
-        return False
-    try:
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        return True
-    except Exception:                                # pragma: no cover
-        return False
+def apply_hardware_settings(log=None) -> Dict[str, object]:
+    """
+    Push the resolved CPU/GPU settings into torch -- once -- and report what
+    actually landed.
+
+    THIS IS THE ONLY PLACE IN STAGE 9.1 THAT WRITES A TORCH BACKEND GLOBAL,
+    and that is the point. The writes used to be split between two functions
+    that disagreed: hw.apply() switched TF32 and the float32 matmul precision
+    on from the compute capability alone, and enable_tf32() then read
+    config.STAGE9_1_TF32 -- but could only ever turn TF32 *on*, never off. On
+    an Ampere card `STAGE9_1_TF32 = False` therefore printed "TF32 OFF" over
+    kernels that were still using it. Here config decides and the hardware only
+    fills in the "auto"s, so the banner and the kernels cannot disagree.
+
+    Returns the values the banner should report -- resolved, not requested.
+    """
+    hw = get_profile()
+    want_tf32 = bool(hw_setting("tf32")) and torch.cuda.is_available()
+    prec = hw_setting("matmul_precision")
+    if _is_auto(prec):
+        # "high" is what auto-TF32 has always implied; "highest" is its honest
+        # opposite, and leaving the global untouched would not be.
+        prec = "high" if want_tf32 else "highest"
+
+    applied = hw.apply(
+        threads          = resolve_torch_threads(),
+        tf32             = want_tf32,
+        matmul_precision = prec,
+    )
+    if log is not None:
+        for line in applied:
+            log(f"  hardware: {line}")
+    return {
+        "tf32":             want_tf32 and hw.supports_tf32,
+        "tf32_requested":   bool(hw_setting("tf32")),
+        "matmul_precision": prec,
+        "applied":          applied,
+    }
 
 
 def resolve_amp(device: str, setting=None):
@@ -328,8 +706,7 @@ def resolve_amp(device: str, setting=None):
     None on CPU, where autocast buys nothing here and would only complicate the
     equivalence self-test.
     """
-    if setting is None:
-        setting = getattr(config, "STAGE9_1_AMP", "auto")
+    setting = hw_setting("amp", setting)
     if not setting or _device_type(device) != "cuda":
         return None
     if isinstance(setting, str):
@@ -380,8 +757,7 @@ def build_batches(
     curriculum rather than a random one. Within-batch length correlation
     remains, which is the accepted cost of bucketing.
     """
-    if bucketing is None:
-        bucketing = getattr(config, "STAGE9_1_LENGTH_BUCKETING", True)
+    bucketing = bool(hw_setting("length_bucketing", bucketing))
     if max_tokens is None:
         max_tokens = getattr(config, "STAGE9_1_MAX_BATCH_TOKENS", 65536)
     if max_mols is None:
@@ -482,6 +858,7 @@ def reinforce_rollout_batched(
     kl_beta:     float = 0.0,
     amp_dtype          = None,
     ref_model          = None,
+    max_tokens:  int   = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
     """
     One-shot REINFORCE rollout for a WHOLE BATCH in two forward passes.
@@ -519,9 +896,14 @@ def reinforce_rollout_batched(
             f"{tokenizer.padding_side!r}."
         )
 
-    max_len = getattr(tokenizer, "model_max_length", MAX_MODEL_TOKENS)
+    # config.STAGE9_1_MAX_SEQ_TOKENS is a CEILING, never a raise: a tokenizer
+    # that reports a shorter window than the knob still wins, because exceeding
+    # the model's own positional range is a crash, not a slow run.
+    cap     = resolve_max_seq_tokens(max_tokens)
+    max_len = getattr(tokenizer, "model_max_length", cap)
     if max_len is None or max_len > 1024:
-        max_len = MAX_MODEL_TOKENS
+        max_len = cap
+    max_len = min(int(max_len), cap)
 
     enc = tokenizer(
         masked_list, return_tensors="pt", padding=True,
@@ -601,17 +983,45 @@ class ScoringPool:
     interrupted run.
     """
 
-    def __init__(self, workers: int):
-        self.workers = max(0, int(workers))
+    def __init__(
+        self,
+        workers:          int,
+        *,
+        start_method:     str = None,
+        chunk_factor:     int = None,
+        maxtasksperchild: int = None,
+        blas_threads:     int = None,
+    ):
+        """
+        Every argument past `workers` is keyword-only and defaults to the
+        config/preset value, so `ScoringPool(n)` keeps working unchanged --
+        which matters because Stage 10.1 imports this class and constructs it
+        exactly that way.
+        """
+        self.workers          = max(0, int(workers))
+        self.start_method     = resolve_pool_start_method(start_method)
+        self.chunk_factor     = max(1, int(hw_setting("pool_chunk_factor",
+                                                      chunk_factor)))
+        self.maxtasksperchild = hw_setting("pool_maxtasksperchild",
+                                           maxtasksperchild)
+        self.blas_threads     = resolve_worker_blas_threads(blas_threads)
         self.pool = None
 
     def __enter__(self) -> "ScoringPool":
         if self.workers > 0:
-            # Explicit spawn context so behaviour is identical on Linux and
-            # Windows rather than silently forking on one and not the other.
-            ctx = mp.get_context("spawn")
+            # Explicit start method so behaviour is identical on Linux and
+            # Windows rather than silently forking on one and not the other;
+            # see resolve_pool_start_method for why the default is "spawn".
+            ctx = mp.get_context(self.start_method)
+            # initargs pins each worker's BLAS/OpenMP threads. Without it, W
+            # workers x T threads oversubscribe a W-core allocation and the
+            # pool can end up slower than serial scoring.
             self.pool = ctx.Pool(
-                processes=self.workers, initializer=worker.init_worker,
+                processes        = self.workers,
+                initializer      = worker.init_worker,
+                initargs         = (self.blas_threads,),
+                maxtasksperchild = (int(self.maxtasksperchild)
+                                    if self.maxtasksperchild else None),
             )
         return self
 
@@ -628,16 +1038,19 @@ class ScoringPool:
         if self.pool is None:
             return worker.score_many(pairs)
         # chunksize so each worker gets a contiguous slice rather than paying
-        # per-item IPC on a batch this small.
-        chunk = max(1, len(pairs) // (self.workers * 2) or 1)
+        # per-item IPC on a batch this small. The factor trades scheduling
+        # granularity against IPC: 1 is one chunk per worker (least IPC, worst
+        # tail latency if one molecule is slow), higher values re-balance.
+        chunk = max(1, len(pairs) // (self.workers * self.chunk_factor) or 1)
         return self.pool.map(worker.score_one, pairs, chunksize=chunk)
 
 
 def score_batch(
-    generated: List[str],
-    parents:   List[str],
-    pool:      "ScoringPool",
-    weights:   Tuple[float, ...] = SCORE_WEIGHTS,
+    generated:       List[str],
+    parents:         List[str],
+    pool:            "ScoringPool",
+    weights:         Tuple[float, ...] = SCORE_WEIGHTS,
+    tox21_subbatch:  int = None,
 ) -> Tuple[List[float], List[Dict[str, float]]]:
     """
     Score a batch: RDKit terms in the pool, the Tox21 term here as one batched
@@ -650,8 +1063,17 @@ def score_batch(
     measured = pool.measure(list(zip(generated, parents)))
 
     if _TOX21_AVAILABLE:
-        for m, clean in zip(measured, score_tox21_batch(generated)):
-            m["tox21"] = clean
+        # One forward for the whole batch by default. config.STAGE9_1_TOX21_
+        # SUBBATCH splits it when that single allocation -- [B, 256] through a
+        # second transformer -- is what exhausts the card. Chunking is exactly
+        # equivalent: the classifier is frozen and in eval(), so no row's
+        # logits depend on any other row.
+        step  = resolve_tox21_subbatch(tox21_subbatch) or len(generated) or 1
+        clean: List[float] = []
+        for i in range(0, len(generated), step):
+            clean.extend(score_tox21_batch(generated[i:i + step]))
+        for m, c in zip(measured, clean):
+            m["tox21"] = c
 
     scored = [compose_stage9_score(m, weights) for m in measured]
     return [s for s, _ in scored], [c for _, c in scored]
@@ -676,6 +1098,7 @@ def run_stage9_1_finetuning(
     score_weights:  Tuple[float, ...] = SCORE_WEIGHTS,
     batched:        bool  = None,
     workers:        int   = None,
+    speed:          str   = None,
 ) -> Dict[str, list]:
     """
     Stage 9's REINFORCE loop with the batched rollout and the scoring pool.
@@ -687,7 +1110,20 @@ def run_stage9_1_finetuning(
 
     Checkpoint layout is Stage 9's, written by the same helpers, so a run can
     be inspected or resumed with the same tooling.
+
+    `batched`, `workers` and `speed` are the hardware overrides: each beats
+    the matching config entry, and `speed` beats config.STAGE9_1_SPEED for
+    the rest of the process.
     """
+    if speed:
+        # Process-wide, exactly as --speed is, and for the same reason:
+        # the rollout, ScoringPool and build_batches take no speed
+        # argument and read the resolver directly. A `speed=` that only
+        # relabelled the banner while the run used config's preset would
+        # be worse than having no argument at all.
+        global _SPEED_OVERRIDE
+        _SPEED_OVERRIDE = resolve_speed(speed)
+
     save_dir = save_dir or getattr(config, "STAGE9_1_LORA_DIR", None) \
         or config.STAGE9_LORA_DIR
     os.makedirs(save_dir, exist_ok=True)
@@ -706,24 +1142,41 @@ def run_stage9_1_finetuning(
             tqdm.write(msg)
 
     hw = get_profile()
-    hw.apply()                       # torch threads, TF32, matmul precision
+    # Writes torch's thread count, TF32 flag and matmul precision from the
+    # RESOLVED config -- see apply_hardware_settings for why this is the only
+    # call site allowed to touch those globals.
+    precision = apply_hardware_settings(log=log)
     if isinstance(batch_size, str) and batch_size.lower() == "hardware":
         # Sized from the dataset and epoch budget, not from GPU memory -- see
         # HardwareProfile.recommended_batch_size for why memory is the wrong
         # target for a 44M-parameter model.
         batch_size = hw.recommended_batch_size(
             seq_len=128, vocab=767, n_pairs=len(pairs), n_epochs=num_epochs,
+            min_total_steps = int(hw_setting("hw_min_total_steps")),
+            max_batch       = int(hw_setting("hw_max_batch")),
+            headroom        = float(hw_setting("hw_mem_headroom")),
         )
         log(f"  Batch size {batch_size} chosen by hardware_autotune "
-            f"(config.STAGE9_1_BATCH_SIZE='hardware').")
+            f"(config.STAGE9_1_BATCH_SIZE='hardware', "
+            f">= {int(hw_setting('hw_min_total_steps'))} total optimizer steps, "
+            f"cap {int(hw_setting('hw_max_batch'))}).")
 
     # config batch size is the GLOBAL batch; split it so the optimizer-step
     # count matches a single-GPU run. See the DDP note above.
     global_batch = batch_size
-    if is_dist and not isinstance(batch_size, str):
+    split_batch  = bool(hw_setting("ddp_split_batch"))
+    if is_dist and split_batch and not isinstance(batch_size, str):
         batch_size = max(1, int(batch_size) // world_size)
         log(f"  DDP: global batch {global_batch} split across {world_size} "
             f"rank(s) -> {batch_size} per rank (step count unchanged).")
+    elif is_dist and not split_batch:
+        # Opting out is legitimate -- it is how you deliberately scale the
+        # effective batch with the world size -- but it is the trap described
+        # above, so it never happens silently.
+        log(f"  DDP: STAGE9_1_DDP_SPLIT_BATCH=False, so {batch_size} is PER "
+            f"RANK. Effective batch is {world_size}x larger and this run takes "
+            f"{world_size}x FEWER optimizer steps than a single-GPU run on the "
+            f"same data. Raise the learning rate or the epoch count to match.")
 
     # Divide the CPU allocation between ranks sharing this node, or 8 ranks
     # each spawning a full-size pool will oversubscribe every core.
@@ -805,41 +1258,82 @@ def run_stage9_1_finetuning(
             core = model
             model = torch.nn.parallel.DistributedDataParallel(
                 model, device_ids=[local_rank], output_device=local_rank,
-                find_unused_parameters=False,
+                find_unused_parameters=bool(hw_setting("ddp_find_unused")),
             )
         else:
             model = torch.nn.parallel.DistributedDataParallel(
-                model, find_unused_parameters=False,
+                model, find_unused_parameters=bool(hw_setting("ddp_find_unused")),
             )
         log(f"  DDP: {world_size} rank(s), backend "
             f"{'nccl' if torch.cuda.is_available() else 'gloo'}.")
 
     amp_dtype = resolve_amp(device)
-    tf32_on   = enable_tf32()
+    tf32_on   = bool(precision["tf32"])
     # fp16 needs loss scaling to keep small gradients from flushing to zero;
-    # bf16 has fp32's exponent range and does not.
-    scaler = (torch.amp.GradScaler(_device_type(device))
-              if amp_dtype == torch.float16 else None)
+    # bf16 has fp32's exponent range and does not. "auto" is that rule; the
+    # override exists for the case where fp16 gradients are overflowing anyway
+    # and a fixed init_scale is the diagnosis.
+    want_scaler = hw_setting("grad_scaler")
+    if _is_auto(want_scaler):
+        want_scaler = (amp_dtype == torch.float16)
+    scaler = None
+    if want_scaler and _device_type(device) == "cuda":
+        init_scale = hw_setting("grad_scaler_init_scale")
+        scaler = torch.amp.GradScaler(
+            _device_type(device),
+            **({} if init_scale is None else {"init_scale": float(init_scale)}),
+        )
 
     est_steps = (len(pairs) // int(batch_size)
                  if not isinstance(batch_size, str) else None)
+    _threads = resolve_torch_threads()
+    _tokens  = getattr(config, "STAGE9_1_MAX_BATCH_TOKENS", 65536)
+    _tox_sub = resolve_tox21_subbatch()
+    # Every line reports the RESOLVED value and names the knob that set it, so
+    # "which speedups did this run actually use?" is answerable from the log
+    # alone -- config.py alone cannot answer it, because of the "auto"s.
     tqdm.write(
+        f"  speed preset       : {resolve_speed(speed)!r}"
+        f"   [config.STAGE9_1_SPEED]\n"
         f"  7a batched rollout : {'ON' if batched else 'OFF (per-molecule, as Stage 9)'}"
         f"   [config.STAGE9_1_BATCHED_ROLLOUT]\n"
         f"  7b scoring workers : {workers if workers else 'serial (no pool)'}"
-        f"   [config.STAGE9_1_SCORING_WORKERS]\n"
+        + (f", {resolve_pool_start_method()} start, "
+           f"chunk/{hw_setting('pool_chunk_factor')}, "
+           f"{resolve_worker_blas_threads()} BLAS thread(s) each" if workers else "")
+        + f"   [config.STAGE9_1_SCORING_WORKERS]\n"
         f"  batch size         : {batch_size}"
         + (f"  (~{est_steps} optimizer steps/epoch)" if est_steps else
-           f"  (<= {getattr(config, 'STAGE9_1_MAX_BATCH_TOKENS', 65536)} padded tokens/batch)")
+           f"  (<= {_tokens} padded tokens/batch)")
         + f"   [config.STAGE9_1_BATCH_SIZE]\n"
         f"  precision          : "
         + (f"{str(amp_dtype).replace('torch.', '')} autocast "
            f"(fp32 log-softmax/KL)" if amp_dtype else "fp32")
-        + (f" + TF32 matmul" if tf32_on else "")
-        + f"   [config.STAGE9_1_AMP]\n"
+        + (f" + GradScaler" if scaler is not None else "")
+        + f"   [config.STAGE9_1_AMP, _GRAD_SCALER]\n"
+        f"  TF32 / matmul      : "
+        + ("ON" if tf32_on else
+           ("OFF" if precision["tf32_requested"] else "OFF (not requested)"))
+        + (" (requested, but this GPU has no TF32 path)"
+           if precision["tf32_requested"] and not tf32_on
+           and torch.cuda.is_available() else "")
+        + f", float32 precision '{precision['matmul_precision']}'"
+        f"   [config.STAGE9_1_TF32, _MATMUL_PRECISION]\n"
         f"  length bucketing   : "
-        f"{'ON' if getattr(config, 'STAGE9_1_LENGTH_BUCKETING', True) else 'OFF'}"
-        f"   [config.STAGE9_1_LENGTH_BUCKETING]"
+        f"{'ON' if hw_setting('length_bucketing') else 'OFF'}"
+        f"   [config.STAGE9_1_LENGTH_BUCKETING]\n"
+        f"  cpu threads        : "
+        + (f"{_threads}" if _threads else "torch default (untouched)")
+        + f"   [config.STAGE9_1_TORCH_THREADS]\n"
+        f"  seq truncation     : {resolve_max_seq_tokens()} tokens"
+        f"   [config.STAGE9_1_MAX_SEQ_TOKENS]\n"
+        f"  tox21 forward      : "
+        + (f"{_tox_sub}/chunk" if _tox_sub else "whole batch in one forward")
+        + f"   [config.STAGE9_1_TOX21_SUBBATCH]"
+        + (f"\n  DDP                : {world_size} ranks, "
+           f"{'global batch split' if split_batch else 'batch is PER RANK'}, "
+           f"find_unused={bool(hw_setting('ddp_find_unused'))}"
+           f"   [config.STAGE9_1_DDP_*]" if is_dist else "")
     )
     if est_steps is not None and est_steps * num_epochs < 500:
         tqdm.write(
@@ -866,12 +1360,28 @@ def run_stage9_1_finetuning(
     _first = build_batches(pairs, tokenizer, batch_size, random.Random(0))
     total_batches = remaining_epochs * (len(_first) // max(world_size, 1))
 
+    # A real terminal honours tqdm's \r-overwrite (one updating line); a
+    # redirected/log-captured run (SLURM .out, `> run.log`) has no terminal
+    # to interpret \r, so the live bar is disabled there and
+    # make_progress_reporter substitutes coarse, rate-limited status lines
+    # instead -- see its docstring in stage9_masked_property_finetune.py.
+    _interactive = bool(getattr(sys.stdout, "isatty", lambda: False)())
     pbar = tqdm(
         total=total_batches, desc="Stage 9.1 property fine-tuning", unit="batch",
-        dynamic_ncols=True, disable=not is_main,
+        dynamic_ncols=True, disable=(not is_main) or (not _interactive),
         bar_format=("{l_bar}{bar}| {n_fmt}/{total_fmt} batches "
                     "[{elapsed}<{remaining}, {rate_fmt}] {postfix}"),
     )
+    # Non-main ranks are passed interactive=True purely to make them skip the
+    # periodic plain-text fallback below -- their pbar is already disable=True
+    # (harmless no-op updates), and only the main rank should ever print a
+    # status line, interactive or not.
+    report_progress = make_progress_reporter(pbar, total_batches, _interactive or not is_main)
+
+    # Resolved once, outside the loop: these are per-run constants, and
+    # re-resolving them per batch would put a getattr chain in the hot path.
+    max_seq_tokens = resolve_max_seq_tokens()
+    tox21_subbatch = resolve_tox21_subbatch()
 
     with ScoringPool(workers) as pool:
         for epoch in range(start_epoch, num_epochs + 1):
@@ -899,6 +1409,7 @@ def run_stage9_1_finetuning(
                         masked_list, tokenizer, model, device,
                         top_k=top_k, temperature=temperature, kl_beta=kl_beta,
                         amp_dtype=amp_dtype, ref_model=core,
+                        max_tokens=max_seq_tokens,
                     )
                 else:
                     # Reference path: Stage 9's per-molecule rollout, kept so the
@@ -915,7 +1426,8 @@ def run_stage9_1_finetuning(
                     log_probs = torch.stack(lp_list)
                     kls       = torch.stack(kl_list)
 
-                scores, comps = score_batch(generated, parents, pool, score_weights)
+                scores, comps = score_batch(generated, parents, pool,
+                                            score_weights, tox21_subbatch)
 
                 # The advantage is a constant multiplier -- no gradient path
                 # through the score, which is the whole point of REINFORCE.
@@ -974,15 +1486,14 @@ def run_stage9_1_finetuning(
                 ep_kl.append(float(kls.sum().detach()) / n_masks if kl_beta > 0 else 0.0)
                 global_step += 1
 
-                pbar.set_postfix_str(
+                report_progress(
+                    global_step,
                     f"ep={epoch}/{num_epochs}  score={mean_reward:.3f}  "
                     f"loss={batch_loss.item():.4f}  valid={ep_valid[-1]:.0%}  "
                     f"novelty={ep_novelty[-1]:.2f}  tox_free={ep_tox_free[-1]:.0%}  "
                     f"baseline={baseline:.3f}"
                     + (f"  kl/pos={ep_kl[-1]:.3f}" if kl_beta > 0 else ""),
-                    refresh=True,
                 )
-                pbar.update(1)
 
             def _avg(xs):
                 return sum(xs) / max(len(xs), 1)
@@ -1045,19 +1556,44 @@ def run_stage9_1_finetuning(
 # ════════════════════════════════════════════════════════════════════════════
 
 def main(max_pairs_per_source: int = None, sample_seed: int = None,
-         batched: bool = None, workers: int = None) -> None:
+         batched: bool = None, workers: int = None, speed: str = None) -> None:
+    if speed:
+        # Process-wide, so every hw_setting() call below sees it -- including
+        # the ones inside ScoringPool and the rollout, which take no speed arg.
+        global _SPEED_OVERRIDE
+        _SPEED_OVERRIDE = resolve_speed(speed)
     save_dir = getattr(config, "STAGE9_1_LORA_DIR", None) or config.STAGE9_LORA_DIR
+
+    # Under torchrun EVERY rank runs main(). Only training is a collective;
+    # banners, the summary and the evaluation pass must happen exactly once.
+    # N ranks racing to write the same PNG/CSV corrupts the figure, and
+    # run_property_distribution_eval can prompt on stdin
+    # (confirm_partial_sources_or_exit) -- from a rank with no terminal that is
+    # a hang, not an error.
+    if int(os.environ.get("RANK", "0")) != 0:
+        run_stage9_1_finetuning(
+            pairs=collect_all_training_pairs(), save_dir=save_dir,
+            batched=batched, workers=workers, speed=speed,
+        )
+        return
+
     print("\n" + "=" * 60)
     print("STAGE 9.1 -- BATCHED ROLLOUT + PARALLEL RDKit SCORING")
     print("=" * 60)
+    _hw = describe_hardware_settings()
     print(f"""
   Same objective, data and estimator as Stage 9 -- only faster.
     7a  one padded forward per batch instead of one per molecule
-        (config.STAGE9_1_BATCHED_ROLLOUT={getattr(config, 'STAGE9_1_BATCHED_ROLLOUT', 'auto')!r}
-         -> {'ON' if resolve_batched(batched) else 'OFF'})
+        (config.STAGE9_1_BATCHED_ROLLOUT -> {'ON' if resolve_batched(batched) else 'OFF'})
     7b  RDKit scored across a process pool; Tox21 batched on this process
-        (config.STAGE9_1_SCORING_WORKERS={getattr(config, 'STAGE9_1_SCORING_WORKERS', 'auto')!r}
-         -> {resolve_workers(workers) or 'serial'})
+        (config.STAGE9_1_SCORING_WORKERS -> {resolve_workers(workers) or 'serial'})
+
+  Speed preset : {_hw['speed']!r}   [config.STAGE9_1_SPEED]
+                 'off' = no speedups (Stage 9 parity) | 'safe' = pool + threads
+                 only | 'fast' = everything (default). Any individual
+                 config.STAGE9_1_* knob overrides the preset; --speed LEVEL
+                 overrides config. Run with --hardware to print every resolved
+                 value and exit.
 
   Output dir : {save_dir}
   Tox21      : {"loaded" if _TOX21_AVAILABLE else "NOT configured -- tox21 term contributes 0"}
@@ -1070,6 +1606,7 @@ def main(max_pairs_per_source: int = None, sample_seed: int = None,
 
     history = run_stage9_1_finetuning(
         pairs=pairs, save_dir=save_dir, batched=batched, workers=workers,
+        speed=speed,
     )
 
     print("\n" + "=" * 60)
@@ -1095,9 +1632,13 @@ def _parse_args(argv: list) -> tuple:
     --limit N / --seed N : as Stage 9 and Stage 9a ("none"/"all"/0 = no limit).
     --workers N          : override config.STAGE9_1_SCORING_WORKERS (0 = serial).
     --no-batch           : force Stage 9's per-molecule rollout (7a off).
+    --speed LEVEL        : override config.STAGE9_1_SPEED for this run --
+                           off | safe | fast | auto. This is the flag for
+                           timing two presets against each other without
+                           editing config between the runs.
     """
-    limit = seed = workers = None
-    for flag in ("--limit", "--seed", "--workers"):
+    limit = seed = workers = speed = None
+    for flag in ("--limit", "--seed", "--workers", "--speed"):
         if flag not in argv:
             continue
         idx = argv.index(flag)
@@ -1108,20 +1649,139 @@ def _parse_args(argv: list) -> tuple:
             limit = 0 if raw.lower() in ("none", "all", "0") else int(raw)
         elif flag == "--seed":
             seed = int(raw)
+        elif flag == "--speed":
+            speed = resolve_speed(raw)       # validates now, not 20 minutes in
         else:
             workers = int(raw)
     batched = False if "--no-batch" in argv else None
-    return limit, seed, batched, workers
+    return limit, seed, batched, workers, speed
 
 
 # ════════════════════════════════════════════════════════════════════════════
 #  SELF-TEST
 # ════════════════════════════════════════════════════════════════════════════
 
+def _test_hardware_resolution() -> None:
+    """
+    Pin the precedence rule the whole config surface rests on --
+
+        explicit argument  >  config.STAGE9_1_<KNOB>  >  config.STAGE9_1_SPEED
+
+    -- and the defect it was written to fix: STAGE9_1_TF32 = False used to be
+    unable to turn TF32 off, because the hardware profile had already switched
+    it on before the flag was read, so the banner reported OFF over kernels
+    that were still using it.
+
+    Mutates config in place and restores it, including deleting any attribute
+    that did not exist before, so a partial config cannot leak settings into
+    the tests that follow.
+    """
+    saved = {k: getattr(config, k) for k in dir(config)
+             if k.startswith("STAGE9_1_")}
+
+    def _restore():
+        for k in [k for k in dir(config) if k.startswith("STAGE9_1_")]:
+            if k not in saved:
+                delattr(config, k)
+        for k, v in saved.items():
+            setattr(config, k, v)
+
+    try:
+        # Every per-knob override cleared, so the preset alone is in charge.
+        for k in _PRESET_KEYS:
+            setattr(config, "STAGE9_1_" + k.upper(), None)
+
+        config.STAGE9_1_SPEED = "off"
+        off = describe_hardware_settings()
+        assert off["batched_rollout"] is False,  "'off' must disable 7a"
+        assert off["scoring_workers"] == 0,      "'off' must score serially"
+        assert off["amp"] is False and off["tf32"] is False, "'off' must be fp32"
+        assert off["length_bucketing"] is False, "'off' must not reorder batches"
+        assert off["torch_threads"] == 0, "'off' must leave torch threads untouched"
+
+        config.STAGE9_1_SPEED = "safe"
+        safe = describe_hardware_settings()
+        assert safe["scoring_workers"] == resolve_workers("auto"), (
+            "'safe' keeps the pool -- it is the one speedup that provably "
+            "cannot change results (self-test [4])")
+        assert safe["batched_rollout"] is False and safe["amp"] is False, (
+            "'safe' must not touch sampling order or arithmetic precision")
+
+        config.STAGE9_1_SPEED = "fast"
+        fast = describe_hardware_settings()
+        assert fast["batched_rollout"] == torch.cuda.is_available()
+        assert fast["tf32"] is True and fast["length_bucketing"] is True
+        assert fast["amp"] == "auto"
+
+        # A per-knob override beats the preset, in BOTH directions -- turning a
+        # speedup off inside "fast" and on inside "off".
+        config.STAGE9_1_LENGTH_BUCKETING = False
+        assert hw_setting("length_bucketing") is False, "knob must beat preset"
+        config.STAGE9_1_SPEED = "off"
+        config.STAGE9_1_LENGTH_BUCKETING = True
+        assert hw_setting("length_bucketing") is True
+        config.STAGE9_1_LENGTH_BUCKETING = None
+
+        # An explicit argument beats config.
+        config.STAGE9_1_SCORING_WORKERS = 8
+        assert resolve_workers(0) == 0, "explicit argument must beat config"
+        assert resolve_workers() == 8
+        config.STAGE9_1_SCORING_WORKERS = None
+
+        # False is a VALUE, not "unspecified" -- which is why every OFF state
+        # in the presets is spelled False or 0 and never None.
+        config.STAGE9_1_SPEED = "fast"
+        config.STAGE9_1_BATCHED_ROLLOUT = False
+        assert resolve_batched() is False, "False must not be read as unset"
+        config.STAGE9_1_BATCHED_ROLLOUT = None
+
+        # A typo'd preset fails loudly rather than silently running everything.
+        try:
+            resolve_speed("fastt")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("unknown preset must raise, not default to fast")
+
+        # Truncation is a ceiling, and an argument still overrides it.
+        config.STAGE9_1_MAX_SEQ_TOKENS = 64
+        assert resolve_max_seq_tokens() == 64
+        assert resolve_max_seq_tokens(128) == 128
+        config.STAGE9_1_MAX_SEQ_TOKENS = None
+
+        # Pool-shape knobs reach the object that uses them.
+        config.STAGE9_1_POOL_CHUNK_FACTOR   = 4
+        config.STAGE9_1_WORKER_BLAS_THREADS = 2
+        sp = ScoringPool(4)
+        assert sp.chunk_factor == 4 and sp.blas_threads == 2
+        assert sp.start_method == "spawn", "spawn is the default for CUDA safety"
+        config.STAGE9_1_POOL_CHUNK_FACTOR   = None
+        config.STAGE9_1_WORKER_BLAS_THREADS = None
+
+        # THE FIX: STAGE9_1_TF32 = False must actually reach the backend.
+        config.STAGE9_1_TF32 = False
+        info = apply_hardware_settings()
+        assert info["tf32"] is False
+        if torch.cuda.is_available():
+            assert torch.backends.cuda.matmul.allow_tf32 is False, (
+                "STAGE9_1_TF32=False did not reach torch.backends -- this is "
+                "the exact defect these knobs exist to fix")
+        config.STAGE9_1_TF32 = True
+        apply_hardware_settings()
+        if torch.cuda.is_available() and get_profile().supports_tf32:
+            assert torch.backends.cuda.matmul.allow_tf32 is True, (
+                "STAGE9_1_TF32=True did not reach torch.backends")
+    finally:
+        _restore()
+        apply_hardware_settings()        # leave the process as config asks
+    print("  [0] hardware knobs: preset < config < argument; TF32 honoured  OK")
+
+
 def _run_self_test() -> None:
     """
     The tests that matter for 7a/7b, in order of what they pin down:
 
+      0. the hardware knobs resolve as documented, and TF32=False reaches torch
       1. padding never reaches real positions (batched logits == batch-1)
       2. the whole batched rollout reproduces Stage 9's EXACTLY at top_k=1,
          where sampling is deterministic -- this is what validates the
@@ -1132,6 +1792,10 @@ def _run_self_test() -> None:
     """
     import tempfile
     from stage9_masked_property_finetune import get_chemberta_tokenizer
+
+    # First, because it needs no model and because everything below runs under
+    # whatever it leaves applied.
+    _test_hardware_resolution()
 
     tokenizer, model, device = load_chemberta_for_policy()
     model.eval()
@@ -1211,6 +1875,21 @@ def _run_self_test() -> None:
     assert c_ser[1]["valid"] == 0.0, "invalid SMILES must score valid=0"
     assert c_ser[0]["novelty"] == 0.0, "identical molecule must score novelty=0"
 
+    # ── 4a. chunking the Tox21 forward changes nothing ─────────────────────
+    # config.STAGE9_1_TOX21_SUBBATCH exists so a large batch does not OOM on
+    # the one score term that stays on this process. It is only worth having if
+    # it is exact, which it is: the classifier is frozen and in eval(), so no
+    # row's logits depend on any other row.
+    if _TOX21_AVAILABLE:
+        with ScoringPool(0) as serial:
+            s_whole, _ = score_batch(gen_list, par_list, serial, tox21_subbatch=0)
+            s_chunk, _ = score_batch(gen_list, par_list, serial, tox21_subbatch=1)
+        for a, b in zip(s_whole, s_chunk):
+            assert abs(a - b) < 1e-9, f"tox21 sub-batching moved a score: {a} vs {b}"
+        print("  [4a] tox21 sub-batched forward == whole-batch forward  OK")
+    else:
+        print("  [4a] tox21 sub-batching skipped (classifier not configured)  OK")
+
     # ── 4b. batching: no pair lost or duplicated, budgets respected ────────
     many = [(f"C{'C'*i}<mask>O", f"C{'C'*i}CO") for i in range(1, 120)]
     for bs in (16, "auto"):
@@ -1280,11 +1959,22 @@ if __name__ == "__main__":
     mp.freeze_support()
     if "--hardware" in sys.argv:
         from hardware_autotune import get_profile as _gp
+        # The machine, then what THIS stage resolved for it -- the second half
+        # is the one that answers "which speedups am I allowing?", since the
+        # profile knows nothing about config.STAGE9_1_SPEED.
+        _spd = _parse_args(sys.argv)[4]
+        if _spd:
+            _SPEED_OVERRIDE = _spd
         print(_gp().describe())
+        print("\n  STAGE 9.1 RESOLVED SETTINGS  "
+              "(config.STAGE9_1_* over config.STAGE9_1_SPEED over hardware)")
+        for _k, _v in describe_hardware_settings().items():
+            print(f"    {_k:<20}: {_v}")
+        print("=" * 68)
         sys.exit(0)
     if "--test" in sys.argv:
         _run_self_test()
     else:
-        _limit, _seed, _batched, _workers = _parse_args(sys.argv)
+        _limit, _seed, _batched, _workers, _speed = _parse_args(sys.argv)
         main(max_pairs_per_source=_limit, sample_seed=_seed,
-             batched=_batched, workers=_workers)
+             batched=_batched, workers=_workers, speed=_speed)

@@ -45,6 +45,7 @@ import os
 import random
 import sys
 import warnings
+from types import SimpleNamespace
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import matplotlib
@@ -65,8 +66,9 @@ import config
 try:
     from tqdm import tqdm
 except ImportError:
-    def tqdm(iterable=None, **kwargs):           # type: ignore[misc]
-        return iterable if iterable is not None else range(0)
+    # A silent stand-in with the same call surface, tqdm.write included;
+    # the old inline stub was a bare function and had no .write.
+    from tqdm_compat import tqdm  # type: ignore[misc]
 
 # ── Optional: SA score ──────────────────────────────────────────────────────
 try:
@@ -112,31 +114,77 @@ def _ensure_torchao(min_version: str = "0.16.0") -> None:
     tqdm.write("  torchao upgrade complete.")
 
 
-_ensure_torchao("0.16.0")
+# ── Optional: peft (LoRA), imported on first use ──────────────────────────────
+# NOTHING peft-related runs at import time, and _ensure_torchao is called from
+# _load_peft rather than here. Importing peft costs ~11 s on top of torch and
+# transformers, and the torchao check can shell out to pip -- a fresh Colab
+# session pays that install before a single line of training runs. Every
+# importer of this module used to pay both, including Stage 10, which trains
+# by unfreezing the last encoder blocks and never builds a LoRA model at all;
+# and under "spawn" every scoring-pool worker re-imports this module and paid
+# them again. Now only a caller that actually wraps a model in LoRA does.
+#
+# find_spec answers "is peft installed?" without importing it, so the banner in
+# main() and the checkpoint branch in train_stage1_9 keep their old meaning at
+# no cost. It can be wrong in one direction -- installed but broken -- which is
+# why _load_peft clears the flag if the import itself fails.
+import importlib.util as _ilu
 
-# ── Optional: peft (LoRA) ───────────────────────────────────────────────────
-# Suppress harmless "Failed to load _C_mxfp8 / _C_cutlass" messages that
-# torchao emits when optional GPU-kernel .so files are missing or built for
-# a different Python ABI (common in Colab after a torchao upgrade).
-import io as _io
-import contextlib as _ctx
+_PEFT_AVAILABLE = _ilu.find_spec("peft") is not None
+_PEFT = None
 
-with _ctx.redirect_stderr(_io.StringIO()):
+
+def _load_peft():
+    """
+    Import peft on first use and return its symbols, or None if unavailable.
+
+    Cached in _PEFT, so every call after the first is free. Returning None
+    rather than raising preserves the old contract: a missing peft downgrades
+    to a full fine-tune with a warning instead of ending the run.
+    """
+    global _PEFT, _PEFT_AVAILABLE
+    if _PEFT is not None:
+        return _PEFT
+    if not _PEFT_AVAILABLE:
+        warnings.warn(
+            "peft not installed - run: pip install peft. "
+            "Falling back to full fine-tuning (higher GPU memory).",
+            stacklevel=2,
+        )
+        return None
+
+    _ensure_torchao("0.16.0")
+
+    # Suppress harmless "Failed to load _C_mxfp8 / _C_cutlass" messages that
+    # torchao emits when optional GPU-kernel .so files are missing or built for
+    # a different Python ABI (common in Colab after a torchao upgrade).
+    import contextlib as _ctx
+    import io as _io
+
+    with _ctx.redirect_stderr(_io.StringIO()):
+        try:
+            import torchao as _torchao_preload  # noqa: F401
+        except Exception:
+            pass
+
     try:
-        import torchao as _torchao_preload  # noqa: F401  (pre-import to swallow .so warnings)
-    except Exception:
-        pass
+        from peft import LoraConfig, PeftModel, TaskType, get_peft_model
+    except ImportError:
+        _PEFT_AVAILABLE = False
+        warnings.warn(
+            "peft is installed but failed to import - falling back to full "
+            "fine-tuning (higher GPU memory).",
+            stacklevel=2,
+        )
+        return None
 
-try:
-    from peft import LoraConfig, TaskType, get_peft_model, PeftModel
-    _PEFT_AVAILABLE = True
-except ImportError:
-    _PEFT_AVAILABLE = False
-    warnings.warn(
-        "peft not installed — run: pip install peft\n"
-        "Falling back to full fine-tuning (higher GPU memory).",
-        stacklevel=1,
+    _PEFT = SimpleNamespace(
+        LoraConfig     = LoraConfig,
+        TaskType       = TaskType,
+        get_peft_model = get_peft_model,
+        PeftModel      = PeftModel,
     )
+    return _PEFT
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -211,13 +259,36 @@ def _load_checkpoint(save_dir: str) -> Optional[dict]:
 
 
 def _ask_resume(save_dir: str, ckpt: dict) -> bool:
-    """Ask the user whether to resume from the checkpoint."""
+    """
+    Ask the user whether to resume from the checkpoint.
+
+    Auto-resumes without prompting whenever stdin is not a TTY -- a Colab
+    `!python ...` cell, a SLURM batch job, a nohup'd run, or any non-rank-0
+    process under torchrun. Those have no terminal, so the prompt could only
+    raise EOFError or block forever; a checkpointed job that was restarted
+    unattended overwhelmingly wants to CONTINUE, and continuing is also the
+    non-destructive choice (answering "no" starts fresh and overwrites the
+    checkpoint). Same convention as stage9's confirm_partial_sources_or_exit.
+
+    EOFError is caught for the same reason: some environments hand us a
+    readable-but-empty stdin that passes isatty() yet returns nothing.
+    """
     last = ckpt["last_epoch"]
     print(f"\n  Checkpoint found in: {save_dir}")
     print(f"  Last completed epoch : {last}")
     print(f"  Global step          : {ckpt['global_step']}")
+
+    if not sys.stdin.isatty():
+        print("  Non-interactive session -- resuming automatically. "
+              "Delete the checkpoint directory to start fresh instead.")
+        return True
+
     while True:
-        ans = input("  Resume from checkpoint? [Y/n]: ").strip().lower()
+        try:
+            ans = input("  Resume from checkpoint? [Y/n]: ").strip().lower()
+        except EOFError:
+            print("  No input available -- resuming automatically.")
+            return True
         if ans in ("", "y", "yes"):
             return True
         if ans in ("n", "no"):
@@ -303,9 +374,10 @@ def load_chemberta_for_policy(
 
     base_model = AutoModelForMaskedLM.from_pretrained(model_name)
 
-    if _PEFT_AVAILABLE:
+    peft = _load_peft()
+    if peft is not None:
         if lora_checkpoint and os.path.isdir(lora_checkpoint):
-            model = PeftModel.from_pretrained(
+            model = peft.PeftModel.from_pretrained(
                 base_model, lora_checkpoint, is_trainable=is_trainable,
             )
             n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -318,15 +390,15 @@ def load_chemberta_for_policy(
                     f"proceed. Check the peft version / adapter contents."
                 )
         else:
-            lora_cfg = LoraConfig(
-                task_type      = TaskType.FEATURE_EXTRACTION,
+            lora_cfg = peft.LoraConfig(
+                task_type      = peft.TaskType.FEATURE_EXTRACTION,
                 r              = lora_rank,
                 lora_alpha     = lora_alpha,
                 lora_dropout   = lora_dropout,
                 target_modules = lora_targets,
                 bias           = "none",
             )
-            model = get_peft_model(base_model, lora_cfg)
+            model = peft.get_peft_model(base_model, lora_cfg)
             trainable, total = model.get_nb_trainable_parameters()
             tqdm.write(
                 f"  LoRA adapters added — trainable params: "

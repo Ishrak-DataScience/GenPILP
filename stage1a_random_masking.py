@@ -101,8 +101,9 @@ from stage2_molecule_generation import generate_smiles, load_chemberta
 try:
     from tqdm import tqdm
 except ImportError:
-    def tqdm(iterable=None, **kwargs):  # type: ignore[misc]
-        return iterable if iterable is not None else range(0)
+    # A silent stand-in with the same call surface, tqdm.write included;
+    # the old inline stub was a bare function and had no .write.
+    from tqdm_compat import tqdm  # type: ignore[misc]
 
 
 CSV_FIELDS = [

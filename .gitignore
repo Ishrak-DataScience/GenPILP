@@ -22,3 +22,8 @@ Dataset/chembl_verified_smiles.csv
 Thumbs.db
 Dataset/chembl_verified_smiles.csv
 Dataset/chembl_verified_smiles.csv
+stage1b_large_scale_plip_mask_summary.csv
+tox21.csv
+outputs/
+# Large generated result files (exceed GitHub 100MB limit)
+experiments/**/stage9a_per_molecule.csv

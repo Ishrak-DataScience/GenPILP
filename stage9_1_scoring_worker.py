@@ -36,16 +36,50 @@ from __future__ import annotations
 from typing import Dict, List, Optional, Tuple
 
 
-def init_worker() -> None:
+def init_worker(blas_threads: int = 1) -> None:
     """
-    Pool initializer: pay the one-off import and catalog-build costs once per
-    worker instead of on whichever molecule happens to arrive first.
+    Pool initializer: pin this worker's BLAS/OpenMP threads, then pay the
+    one-off import and catalog-build costs once per worker instead of on
+    whichever molecule happens to arrive first.
+
+    THREAD PINNING FIRST, AND WHY THE IMPORTS ARE FUNCTION-LOCAL
+    ------------------------------------------------------------
+    W workers each starting T threads produce W*T threads on a W-core
+    allocation, and the contention routinely makes a pooled run SLOWER than a
+    serial one -- the exact failure hardware_autotune.worker_init exists to
+    prevent, which this initializer previously did not do.
+
+    OMP_NUM_THREADS is read by the OpenMP runtime when it is first
+    initialised, which happens on `import torch`. Setting it afterwards is a
+    no-op. That is why this module imports nothing at the top level: under
+    "spawn" the child re-imports only this module (typing alone), so torch is
+    still unimported when the env vars below are written, and they take.
+
+    `blas_threads` comes from config.STAGE9_1_WORKER_BLAS_THREADS via
+    ScoringPool. 1 is correct whenever the pool is sized to the allocation;
+    raise it only if you have deliberately left cores idle.
 
     Building the PAINS and Brenk FilterCatalogs takes ~85 ms. Without this the
     first task on each worker carries that latency, which on a short batch is
     a visible stall rather than an amortised cost.
     """
+    import os
+
+    n = str(max(1, int(blas_threads)))
+    for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+        os.environ[var] = n
+
     from stage9_masked_property_finetune import _get_alert_catalog
+
+    # After the import above, torch exists in this process; set its intra-op
+    # count too, since that one IS honoured post-import (unlike OMP's).
+    try:
+        import torch
+
+        torch.set_num_threads(int(n))
+    except Exception:                                # pragma: no cover
+        pass
 
     _get_alert_catalog("pains")
     _get_alert_catalog("brenk")

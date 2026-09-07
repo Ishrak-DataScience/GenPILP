@@ -221,6 +221,55 @@ position was recorded each epoch alongside the reward components, providing a
 direct read-out of whether $\beta$ is holding the policy near its pretrained
 distribution.
 
+\paragraph{Hardware utilisation.}
+The objective above is kept deliberately separate from the way it is executed,
+so that the identical estimator can be run either as a per-molecule reference
+implementation or through a throughput-oriented path that adapts to whichever
+device a run lands on. In the latter, each mini-batch is right-padded into a
+single $[B, L]$ tensor and costs exactly one policy forward pass and one
+reference forward pass; all $M$ masked positions in the batch are drawn with a
+single \texttt{multinomial} call over the gathered $[M, k]$ top-$k$ matrix, and
+the per-molecule log-probabilities of Eq.~\eqref{eq:stage9-logprob} are
+recovered by a scatter-add over the flat mask index, removing the loop over
+positions and the loop over molecules together. Padding cannot contaminate real
+positions, since the attention mask enters as an additive $-\infty$ bias and
+position indices are a cumulative count over non-padding tokens; batched and
+unbatched logits agree to $\sim\!6\times10^{-6}$ at real positions, a
+float-associativity difference rather than leakage. Because tokenised SMILES
+here span roughly 8 to 500 BPE tokens, pairs are length-bucketed before batching
+--- optionally packed to a fixed padded-token budget rather than a fixed
+molecule count --- so that one long molecule does not pad an entire batch out to
+its length, while batch order is reshuffled every epoch to keep the gradient
+sequence stochastic~\cite{ott2018scaling}. Matrix multiplications run under
+bfloat16 autocast on Ampere-class and later accelerators, and float16 with
+gradient scaling on Volta/Turing, with TF32 enabled for the fp32 matmuls that
+remain~\cite{micikevicius2018mixed}; the log-softmax, the sampled
+log-probabilities and the KL of Eq.~\eqref{eq:stage9-kl} are always evaluated in
+fp32, being the numerically delicate terms and negligible in cost beside the
+forward pass. On the host side, RDKit scoring --- the bottleneck once the
+forward pass is batched, at roughly $9$\,ms per molecule against $\sim\!1$\,ms
+of amortised forward --- is dispatched to a persistent process pool whose
+workers each pin their BLAS threads to one, while the Tox21 term is excluded
+from that pool and evaluated on the accelerator as one batched classifier
+forward so that no worker holds a second copy of the network. Worker and thread
+counts follow the job's actual allocation (scheduler variables, then the process
+CPU-affinity mask, then the cgroup quota) rather than the host core count, which
+on a shared node would oversubscribe cores the job was never granted.
+Multi-device training uses DistributedDataParallel~\cite{li2020pytorchddp} with
+the configured batch treated as a \emph{global} batch split across ranks, so the
+number of optimiser updates matches a single-device run and the gain is purely
+in wall-clock time; the baseline $b$ is all-reduced so that ranks share one
+control variate, ranks receive an equal number of batches so that none leaves
+the gradient all-reduce early, and checkpoints are written by rank 0 alone.
+Batch size is accordingly set from the optimiser-step budget rather than from
+free device memory: at 44 million parameters the backbone cannot fill a modern
+accelerator, and enlarging the batch until it did would only reduce the number
+of high-variance REINFORCE updates taken over the same data. Batched sampling
+consumes the random-number stream in a different order from per-molecule
+sampling, so the two execution paths are compared distributionally rather than
+by exact output matching, with token-for-token equivalence asserted under the
+deterministic $k=1$ setting.
+
 This overall strategy --- pretrain a generative model on a large SMILES
 corpus, then steer it towards desired properties with a policy-gradient
 objective --- follows established practice in de novo molecular
@@ -259,6 +308,537 @@ Gradient-norm clip & 1.0 \\
 Baseline decay & 0.99 \\
 Epochs & 10 \\
 Reward weights $(w_{\mathrm{valid}}, w_{\mathrm{QED}}, w_{\mathrm{SA}}, w_{\mathrm{nov}}, w_{\mathrm{alert}}, w_{\mathrm{tox21}})$ & (0.20, 0.15, 0.10, 0.15, 0.15, 0.25) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+% ============================================================================
+% Stage 10 -- Methods subsection (Nature-style)
+% Property-guided SUPERVISED fine-tuning of ChemBERTa by best-of-K selection.
+% Companion to the Stage 9 subsection above: same data, same masking rate,
+% same rollout distribution and the same property measurement code; only the
+% estimator (and the trainable-parameter budget) differ.
+% ============================================================================
+
+\subsection*{Property-guided supervised fine-tuning by best-of-$K$ selection}
+\label{sec:stage10}
+
+The reinforcement objective of Eq.~\eqref{eq:stage9-loss} is one of two ways to
+turn a non-differentiable chemistry score into a weight update. We implemented
+the second as a controlled comparison. Where Stage 9 differentiates a
+\emph{score-weighted log-probability}, Stage 10 uses the score only to
+\emph{choose a target}, and then performs the ordinary token-level
+cross-entropy that pretrained the model in the first place. Everything that is
+not the estimator is held fixed between the two stages: the training pairs and
+their collection order, the masking rate $p=15\%$, the one-shot rollout and its
+sampling distribution, and the RDKit measurement code used both for the
+objective and for the reported property distributions.
+
+\paragraph{Rationale: selection in place of the score-function estimator.}
+The obstruction described above --- validity, QED, synthetic accessibility,
+novelty and the structural-alert filters are computed by a cheminformatics
+parser acting on a decoded string, so a score returned by RDKit carries no
+gradient --- is a property of the \emph{scoring} function, not of the
+\emph{training} objective. It can therefore be circumvented without a
+score-function estimator at all: sample several completions of the same masked
+molecule, let the score decide which one is best, and fit the model to that
+completion by maximum likelihood. The chemistry then enters only through a
+discrete $\arg\min$, and every quantity that reaches \texttt{backward()} is a
+log-probability produced by the network itself. This is expert
+iteration~\cite{anthony2017expert} in its rejection-sampling form, also known as
+self-taught or reward-ranked fine-tuning~\cite{zelikman2022star,dong2023raft},
+and in molecular design it is the hill-climbing fine-tuning used to build
+focused libraries from a pretrained SMILES
+generator~\cite{segler2018focused,brown2019guacamol}.
+
+Two consequences distinguish it from Eq.~\eqref{eq:stage9-loss}. First, the
+direction of the gradient is bounded: the REINFORCE loss contains the term
+$-(\mathrm{score}-b)\log P_{\theta}$, which for a below-baseline rollout is a
+\emph{positive} multiple of $\log P_{\theta}$ and so drives the model's own
+samples towards probability zero, an objective unbounded below and a known
+source of degenerate optima; cross-entropy is bounded below by zero and only
+ever raises the probability of tokens that were observed to produce a good
+molecule. Second, the achievable optimum is capped by the sampler: selection
+can only ever imitate the best member of a $K$-sample pool and cannot reach a
+completion the model would not already propose, whereas a policy gradient
+places no such ceiling on the direction of the update. Stage 10 accordingly
+trades reach for stability.
+
+\paragraph{Composite loss.}
+Each candidate $\hat{s}$ was scored against its pre-mask parent $s$ by a
+composite \emph{loss} --- the mirror image of the Stage 9 reward of
+Eq.~\eqref{eq:stage9-score}, so that lower is better ---
+\begin{equation}
+\ell(\hat{s}, s) \;=\;
+\begin{cases}
+\;w_{\mathrm{QED}}\bigl(1-\mathrm{QED}(\hat{s})\bigr)
+\;+\; w_{\mathrm{SA}}\,\mathrm{clip}_{[0,1]}\!\left(\dfrac{\mathrm{SA}(\hat{s})-1}{9}\right)
+\;+\; w_{\mathrm{nov}}\,T_{\mathrm{c}}(s,\hat{s})
+\;+\; w_{\mathrm{alert}}\,\mathrm{alert}(\hat{s}),
+& \hat{s}\ \text{valid},\\[2.2ex]
+\;S \;+\; w_{\mathrm{valid}},
+& \hat{s}\ \text{invalid},
+\end{cases}
+\label{eq:stage10-loss}
+\end{equation}
+where $S \equiv w_{\mathrm{QED}} + w_{\mathrm{SA}} + w_{\mathrm{nov}} +
+w_{\mathrm{alert}}$ and the descriptors are those of
+Eq.~\eqref{eq:stage9-score}. Three differences from the Stage 9 reward are
+deliberate. The synthetic-accessibility term is normalised over the score's
+actual range $[1,10]$ as $(\mathrm{SA}-1)/9$ rather than as $\mathrm{SA}/10$,
+so that the easiest-to-synthesise molecule is charged exactly zero. The novelty
+term penalises the Tanimoto \emph{similarity} $T_{\mathrm{c}}(s,\hat{s})$
+directly, which is what makes reconstruction of the parent ---
+$T_{\mathrm{c}}=1$ --- the worst attainable value of that term. And the Tox21
+term is omitted from Eq.~\eqref{eq:stage10-loss}, so that the objective is
+computable from RDKit alone and depends on no auxiliary learned checkpoint;
+this holds for the three execution variants of
+Eq.~\eqref{eq:stage10-loss} described below, and is reversed in Stage 10.4,
+which reinstates the term as a fifth component (see
+\emph{Learned toxicity term} below). Any component that RDKit
+parses but cannot evaluate is charged its full weight, the pessimistic reading
+being the safe one for a criterion whose only role is to rank candidates.
+Weights were $(w_{\mathrm{QED}}, w_{\mathrm{SA}}, w_{\mathrm{nov}},
+w_{\mathrm{alert}}) = (0.30, 0.20, 0.30, 0.20)$, summing to $S=1$, and
+$w_{\mathrm{valid}}=1$.
+
+Validity enters Eq.~\eqref{eq:stage10-loss} not as one weighted term among six
+but as a separating margin. Because the four property terms are individually
+bounded by their weights,
+\begin{equation}
+\sup_{\hat{s}\ \mathrm{valid}} \ell(\hat{s},s) \;=\; S
+\;<\; S + w_{\mathrm{valid}} \;=\; \ell(\hat{s},s)\big|_{\hat{s}\ \mathrm{invalid}}
+\qquad \text{for any } w_{\mathrm{valid}}>0 ,
+\label{eq:stage10-ordering}
+\end{equation}
+so \emph{every} valid candidate outranks \emph{every} invalid one, irrespective
+of its drug-likeness, accessibility, novelty or alert status. Validity is thus
+a lexicographic gate on the selection rather than a quantity traded off against
+the others, and $w_{\mathrm{valid}}$ sets only the size of the margin, never
+the ordering. Encoding the same priority by a large multiplicative penalty
+would instead have made the selection criterion numerically incomparable with
+the cross-entropy it feeds, which is of order $1$--$10$ nats.
+
+\paragraph{Learned toxicity term (Stage 10.4).}
+Stage 10.4 reinstates the Tox21 component of Eq.~\eqref{eq:stage9-score} as a
+fifth term of the selection loss,
+\begin{equation}
+\ell'(\hat{s}, s) \;=\; \ell(\hat{s}, s)
+\;+\; w_{\mathrm{tox21}}\bigl(1 - \hat{p}_{\mathrm{clean}}(\hat{s})\bigr),
+\qquad
+\hat{p}_{\mathrm{clean}} \equiv 1 - \hat{p}_{\mathrm{tox21}},
+\label{eq:stage104-loss}
+\end{equation}
+with the invalid branch likewise charged the full $w_{\mathrm{tox21}}$. The
+worst attainable value for a valid candidate accordingly rises from $S$ to
+$S' \equiv S + w_{\mathrm{tox21}}$ and an invalid candidate scores
+$S' + w_{\mathrm{valid}}$, so the separating margin of
+Eq.~\eqref{eq:stage10-ordering} remains exactly $w_{\mathrm{valid}}$ and
+validity is still a lexicographic gate rather than a traded-off quantity. We
+added the term on top of the existing four weights rather than renormalising
+them, so that every other term retains its Stage 10 meaning and the per-term
+diagnostics remain comparable across variants; only the totals shift.
+$w_{\mathrm{tox21}} = 0.20$, matching $w_{\mathrm{alert}}$, so that the
+rule-based and learned toxicity indicators enter on equal footing and their
+disagreement on generated molecules is itself observable.
+
+The sign convention inverts relative to Stage 9 and the inversion is
+deliberate. In the Stage 9 \emph{reward}, an unavailable classifier
+contributes exactly zero so as not to reward unverified toxicity; here, in a
+\emph{loss}, a candidate the classifier cannot score is charged the full
+weight, which is the same pessimistic reading already applied to every other
+term of Eq.~\eqref{eq:stage10-loss}. One consequence is worth stating because
+it is silent: were no classifier configured at all, that term would take the
+identical constant value for all $K$ candidates of a molecule and could
+therefore not alter the arg-min of Eq.~\eqref{eq:stage10-argmin}. The run
+would be numerically indistinguishable from Stage 10.2 while reporting a
+toxicity curve, so the implementation refuses to begin under that
+configuration rather than degrade silently.
+
+The classifier is a twelve-output sigmoid head fine-tuned from the same
+ChemBERTa backbone as the generator on the Tox21 training
+set~\cite{huang2016tox21,tox21challenge}, so that classifier and generator
+share a tokenizer and the classifier sees the token stream the generator
+actually emits. Of the $7{,}831 \times 12 = 93{,}972$ label cells, $77{,}946$
+($82.9\%$) are observed; a blank denotes an assay not run rather than an
+inactive result, so the training objective is a \emph{masked} binary
+cross-entropy under which unobserved cells contribute neither loss nor
+gradient. Per-assay positive rates span $2.9\%$ (NR-PPAR-$\gamma$) to
+$16.2\%$ (SR-ARE); each assay's positive class is therefore reweighted by its
+training-split negative-to-positive ratio, capped at $50$ so that no single
+rare assay dominates the gradient. Without that reweighting the minimiser
+attains a near-optimal masked cross-entropy by predicting inactivity
+everywhere, which would again render $\hat{p}_{\mathrm{clean}}$ almost
+constant and the term inert. The classifier is partitioned by the same
+Bemis--Murcko framework rule applied to the generator, so that the two splits
+mean the same thing, and its performance is reported as per-assay ROC-AUC over
+the held-out frameworks.
+
+Following the Stage 9.1 arrangement, the classifier is excluded from the RDKit
+worker pool and evaluated as a single batched forward on the training device.
+Stage 10 scores $K$ candidates per molecule rather than one, so two reductions
+are applied, both exact because the classifier is frozen and in evaluation
+mode: candidates that fail to parse take the invalid branch of
+Eq.~\eqref{eq:stage104-loss} and never read the term, so they are not
+submitted; and repeated SMILES --- common, since the $K$ completions are drawn
+from a top-$k$ truncated distribution --- are scored once and the value
+scattered to their positions.
+
+\paragraph{Candidate pool and target selection.}
+For each pair $(\tilde{s}, s)$ a \emph{single} forward pass produced the logits
+$z_i \in \mathbb{R}^{|V|}$ at every masked position $i \in \mathcal{M}$. That
+one pass serves both roles in the algorithm: it defines the proposal
+distribution the candidates are drawn from, and it supplies the logits against
+which the cross-entropy is later computed, so no second forward pass is
+required. $K=16$ completions were drawn independently and identically from the
+same temperature-scaled, top-$k$-truncated distribution used in Stage 9,
+\begin{equation}
+\hat{t}^{(k)}_i \;\sim\; q_{\theta}\bigl(\cdot \mid c(\tilde{s})\bigr)
+\;\propto\; \mathrm{softmax}\bigl(z_i / T\bigr)\Big|_{\mathrm{top}\text{-}k},
+\qquad k = 1,\dots,K, \quad i \in \mathcal{M},
+\label{eq:stage10-sampling}
+\end{equation}
+with $T=1.2$ and $k=20$, and each was decoded to a candidate SMILES
+$\hat{s}^{(k)}$. Sampling was performed under \texttt{detach}: the draw is a
+\emph{search} over possible targets and carries no gradient, which is precisely
+what distinguishes this estimator from REINFORCE, where the sampled token's
+log-probability is retained with its computation graph intact. The pool was
+scored by Eq.~\eqref{eq:stage10-loss} and the winner taken as
+\begin{equation}
+k^{\star} \;=\; \arg\min_{k \in \{1,\dots,K\}} \ell\bigl(\hat{s}^{(k)}, s\bigr),
+\qquad
+\mathcal{V} \;=\; \mathbb{1}\bigl[\hat{s}^{(k^{\star})}\ \text{is valid}\bigr].
+\label{eq:stage10-argmin}
+\end{equation}
+By Eq.~\eqref{eq:stage10-ordering}, $\mathcal{V}=1$ if and only if at least one
+of the $K$ candidates parses.
+
+\paragraph{Parent fallback and its weighting.}
+Measured on these data at $p=15\%$, approximately $70\%$ of molecules yield
+\emph{no} valid completion in $K=16$ draws, and $K=8$ gives an
+indistinguishable rate --- validity is bimodal and molecule-intrinsic here, not
+a matter of drawing enough samples. Those molecules offer nothing worth
+imitating, so the target reverts to the parent's own tokens, which are
+available for every pair and valid by construction:
+\begin{equation}
+\mathbf{t}^{\star} \;=\;
+\begin{cases}
+\bigl(\hat{t}^{(k^{\star})}_i\bigr)_{i \in \mathcal{M}}, & \mathcal{V}=1,\\[1ex]
+\bigl(t^{\,s}_i\bigr)_{i \in \mathcal{M}}, & \mathcal{V}=0,
+\end{cases}
+\qquad
+\omega \;=\;
+\begin{cases}
+1, & \mathcal{V}=1,\\[1ex]
+\lambda_{\mathrm{fb}}, & \mathcal{V}=0,
+\end{cases}
+\label{eq:stage10-target}
+\end{equation}
+where $t^{\,s}_i$ is the token of the canonical parent at position $i$.
+Recovering $t^{\,s}_i$ requires no sequence alignment and involves no
+heuristic. The masker tokenises the \emph{canonical} SMILES and replaces whole
+BPE tokens by single \texttt{<mask>} symbols, so re-tokenising the masked
+string cannot change its length: an unmasked run is the same substring and
+re-merges identically, and each \texttt{<mask>} is a hard boundary that
+prevents neighbouring tokens merging across it. The masked string therefore has
+the same token count as its canonical parent and mask position $i$ holds what
+was parent token $i$; verified at $100\%$ on 500 molecules, against only $16\%$
+agreement when the raw rather than the canonical parent is used. The length
+identity is asserted at every step and a pair that violates it is dropped
+rather than trained on a silently misaligned target.
+
+The fallback target is nonetheless a reconstruction target, and reconstructing
+the parent attains $T_{\mathrm{c}}=1$, the worst possible value of the novelty
+term of Eq.~\eqref{eq:stage10-loss}. Left at full weight it would make roughly
+seven in ten updates train a copier. The scalar $\lambda_{\mathrm{fb}}$
+(default $0.3$) down-weights those updates alone and spans the whole design
+space between the two defensible extremes: $\lambda_{\mathrm{fb}}=1$ trains
+them as ordinary examples, maximising the rate at which validity is acquired at
+the greatest risk of collapse onto the parent, and $\lambda_{\mathrm{fb}}=0$ is
+exactly equivalent to discarding those molecules.
+
+\paragraph{The differentiable objective.}
+With the target fixed, the gradient-carrying part of Stage 10 is ordinary
+masked-language-model cross-entropy on the logits of the original forward pass,
+averaged over a molecule's masked positions so that a heavily masked molecule
+does not dominate a mini-batch merely by having more of them:
+\begin{equation}
+\mathcal{L}_{\mathrm{CE}} \;=\; -\frac{1}{|\mathcal{M}|}
+\sum_{i \,\in\, \mathcal{M}} \log P_{\theta}\bigl(t^{\star}_i \mid c(\tilde{s})\bigr).
+\label{eq:stage10-ce}
+\end{equation}
+In variant~10a this is supplemented by an unlikelihood
+term~\cite{welleck2020unlikelihood} that explicitly suppresses the tokens
+observed to produce invalid molecules. Writing
+\begin{align}
+\mathcal{B} \;&=\; \bigl\{ (k,i) \;:\; \hat{s}^{(k)}\ \text{invalid},\;\;
+i \in \mathcal{M},\;\; \hat{t}^{(k)}_i \neq t^{\star}_i \bigr\}, \notag \\
+\mathcal{L}_{\mathrm{UL}} \;&=\; -\frac{1}{|\mathcal{B}|}
+\sum_{(k,i) \,\in\, \mathcal{B}}
+\log\Bigl(1 - P_{\theta}\bigl(\hat{t}^{(k)}_i \mid c(\tilde{s})\bigr)\Bigr),
+\label{eq:stage10-ul}
+\end{align}
+the per-molecule objective is
+\begin{equation}
+\mathcal{L} \;=\; \omega\,\mathcal{L}_{\mathrm{CE}}
+\;+\; \lambda_{\mathrm{UL}}\,\mathcal{L}_{\mathrm{UL}},
+\label{eq:stage10-total}
+\end{equation}
+averaged over the molecules of a mini-batch. Variant~10b is
+Eq.~\eqref{eq:stage10-total} with $\lambda_{\mathrm{UL}}=0$, that is,
+cross-entropy towards the best candidate alone; the two variants were trained
+from identical code and data into separate output directories so that the
+contribution of the unlikelihood term is isolated. Three details of
+Eq.~\eqref{eq:stage10-ul} are deliberate. The penalty is written on
+$1-P_{\theta}$ rather than as $+\log P_{\theta}$ because the latter diverges as
+the probability is driven to zero, reintroducing exactly the unbounded
+direction that motivated abandoning the policy gradient. Positions at which a
+rejected candidate happens to agree with the target are excluded from
+$\mathcal{B}$, since including them would set the two terms of
+Eq.~\eqref{eq:stage10-total} against each other on the same token. And
+$\mathcal{L}_{\mathrm{UL}}$ is \emph{not} scaled by $\omega$: on a molecule for
+which no candidate was valid, sixteen decoded strings that failed to parse are
+legitimate evidence about what should not be generated, unlike the parent
+reconstruction that $\omega$ exists to discount. Gradients flow through
+$P_{\theta}$ alone; $\mathbf{t}^{\star}$, $\mathcal{B}$ and every value of
+$\ell$ are constants of the step.
+
+\paragraph{Interpretation.}
+Informally, the chemistry acts as a teacher rather than as a signal. At each
+step the model proposes sixteen ways of completing the same masked molecule;
+RDKit reads all sixteen, discards those that are not molecules at all, ranks
+what remains by drug-likeness, ease of synthesis, divergence from the parent
+and absence of structural alerts, and hands back a single answer. The model is
+then taught that answer in exactly the way it was pretrained --- ``at this
+masked position, the token was this one'' --- and nothing about the chemistry
+needs to be differentiable for that lesson to be delivered, because the only
+thing the chemistry ever did was point. Validity improves not because a
+validity gradient exists, but because the tokens that are repeatedly pointed at
+are the ones whose ring closures balance, whose valences are legal and whose
+brackets match. The unlikelihood term of Eq.~\eqref{eq:stage10-ul} is the one
+place where the objective speaks about invalidity directly, and it is also the
+only signal that survives when the teacher has nothing good to point at.
+
+The same reading explains why Stage 10 carries no analogue of the KL anchor of
+Eq.~\eqref{eq:stage9-kl}. The targets of Eq.~\eqref{eq:stage10-target} are
+either drawn from the model's own top-$k$ support or are the tokens of a real
+deposited molecule, so the objective cannot move probability mass onto
+completions the model would never have proposed; the anchoring that
+$\beta D_{\mathrm{KL}}$ supplies explicitly in Stage 9 is implicit in the
+construction of the target here. The corresponding weakness is the mirror
+image: an improvement the sampler never proposes is unreachable, and with a
+$70\%$ fallback rate the majority of updates are parent reconstructions at
+weight $\lambda_{\mathrm{fb}}$ rather than best-of-$K$ imitations. The
+trade-off that $\lambda_{\mathrm{fb}}$ governs --- validity acquired by
+reconstruction against novelty lost to copying --- is therefore the central
+hyperparameter of this stage, and is read off directly from the diagnostics
+below.
+
+\paragraph{Optimisation and trainable parameters.}
+Stage 10 fine-tunes ordinary weights rather than adapters: the LM head together
+with the last $N=1$ of the six encoder blocks of ChemBERTa-zinc-base-v1 was
+left trainable ($7.7$M of $44.1$M parameters, $17.5\%$) and the remainder
+frozen. This is a different capacity budget from the Stage 9 adapters, which
+touch the query and value projections of \emph{every} block at rank 8, and we
+record it here rather than leave it implicit: the two stages differ in their
+trainable parameterisation as well as in their estimator, so the comparison
+between them is not a clean ablation of the loss alone. Mini-batches of 16
+pairs were optimised with Adam~\cite{kingma2015adam} at learning rate
+$5\times10^{-5}$ after clipping the global gradient norm to 1.0, for 4 epochs
+over the same pooled, shuffled Stage 1a/1b pairs used by Stage 9. Only the
+unfrozen tensors are written ($\approx\!30$\,MB against $180$\,MB for the whole
+model), together with the optimiser moments and the state of every random
+stream, so that an interrupted run resumes as the run it was rather than as a
+new one begun from the same weights (see \emph{Checkpointing and run
+provenance} below). The trained model was then evaluated with the identical
+measurement and figure code used for Stage 9, on the same deduplicated
+one-pair-per-parent evaluation set, so that the two stages' property
+distributions are directly comparable.
+
+\paragraph{Execution paths and the equivalence between them.}
+The objective above is specified once and executed by three interchangeable
+implementations, so that the same weights can be produced either by the
+simplest arrangement of the computation or by a throughput-oriented one that
+adapts to whichever device a run lands on. The reference arrangement performs
+one forward pass per molecule and one cheminformatics measurement per
+candidate. The second dispatches the $K\!\times\!B$ candidate measurements of a
+mini-batch to a persistent process pool whose workers each pin their BLAS
+threads to one; because the measurement is a pure function of two decoded
+strings, evaluating it in another process cannot alter a floating-point result,
+and the pooled and serial objectives agree exactly. This is the speedup that
+matters for the present stage: with $K=16$ candidates measured per molecule
+against Stage 9's single sampled molecule, the cheminformatics term is roughly
+sixteen times more dominant here than there, amounting to $256$ measurements
+per optimiser update at the batch size used.
+
+The third arrangement adds the remaining device-level optimisations described
+for Stage 9 --- one right-padded $[B,L]$ forward pass per mini-batch, a single
+\texttt{multinomial} draw over the gathered top-$k$ matrix for every masked
+position in the batch, bfloat16 or float16 autocast with the log-softmax and
+the cross-entropy retained in float32, TF32 for the remaining float32 matrix
+multiplications, length-bucketed batching, thread and worker counts taken from
+the job's actual allocation rather than the host core count, and
+DistributedDataParallel~\cite{li2020pytorchddp} with the configured batch
+treated as a \emph{global} batch split across ranks so that the number of
+optimiser updates is independent of the number of devices.
+
+Unlike the Stage 9 case, these last optimisations are \emph{not} objective
+preserving, and the reason is intrinsic to selection rather than incidental to
+the implementation. A score that multiplies a log-probability, as in
+Eq.~\eqref{eq:stage9-loss}, tolerates a differently drawn sample: the estimator
+remains unbiased. A score that \emph{selects} the target of
+Eq.~\eqref{eq:stage10-argmin} does not. Three separate effects perturb the
+candidate set --- drawing the batch in one \texttt{multinomial} call consumes
+the random stream in a different order from one call per molecule; reduced
+precision displaces the logits in their trailing bits; and dropout, which is
+sampled once per forward pass, supplies $B$ independent masks to $B$ separate
+passes but only one to a single padded pass. The third effect is the largest,
+displacing the logits at masked positions by $\approx\!1.2$ on this model,
+which exceeds the perturbation from reduced precision and cannot be removed by
+seeding, since the two arrangements do not request the same shapes from the
+generator. Any of the three can change which candidate attains the minimum in
+Eq.~\eqref{eq:stage10-argmin}, and the model then learns a different token
+sequence rather than a numerically perturbed update. The tuned arrangement is
+therefore compared with the reference distributionally --- over mean candidate
+validity, mean composite loss and mean novelty --- and never by exact output
+matching, while exact agreement is asserted in the deterministic limit of
+$k=1$ with dropout disabled, which pins the batched indexing itself.
+
+\paragraph{Checkpointing and run provenance.}
+An epoch is not a cheap unit at $K=16$: on the capped Stage 1a/1b pool it is
+several hours, so a checkpoint written only at epoch boundaries makes an
+interruption expensive and a resumption inexact. The two resumable
+implementations therefore write the unfrozen tensors, the Adam moments, the
+running per-epoch aggregates, the batch cursor and the state of the Python,
+CPU and CUDA random streams every fixed number of optimiser updates, by an
+atomic replace so that an interruption during the write cannot destroy the
+previous state. Recording the optimiser is not a convenience: rebuilding Adam
+after each restart discards the accumulated first and second moments and
+imposes a fresh adaptation transient on every resumption, which would otherwise
+appear in the training curve as an artefact of the interruption schedule rather
+than of the objective. Recording the generator state is what makes a resumed
+run a continuation of the run it interrupted, since the same stream draws the
+$K$ candidates of Eq.~\eqref{eq:stage10-sampling}.
+
+Because the three implementations optimise one objective, a single run may
+optionally be carried across them, beginning under the reference arrangement
+and continuing under the tuned one as devices become available. Where that is
+done, the checkpoint additionally carries a provenance record naming which
+implementation trained which epochs, under which arithmetic precision and
+sampling arrangement, and a resumption that changes any of these is reported at
+the point it occurs. This is retained deliberately: by the argument above such
+a run is not homogeneous in the way either implementation is on its own, the
+saved weights carry no trace of the precision under which they were obtained,
+and the distinction is not otherwise recoverable after the fact.
+
+\paragraph{Scaffold-based train--validation partition.}
+The selection objective of Eq.~\eqref{eq:stage10-loss} is optimised by
+cross-entropy towards a target sequence, and on the majority of molecules that
+target is the parent's own tokens (the fallback of
+Sec.~\ref{sec:stage10}, taken on $\sim$70\% of molecules at $p=15\%$).
+Reconstruction is therefore the modal training signal, which makes
+memorisation of the training parents the specific failure mode this design
+invites, and a property distribution computed over those same parents cannot
+distinguish it from generalisation. We therefore partitioned the pooled
+training data before any fine-tuning and report all held-out quantities on
+molecules the model has never been optimised towards.
+
+The partition is made on \emph{molecular frameworks}, not on instances or on
+molecules. Instance-level partitioning is untenable for the reason given above:
+a ligand deposited in many structures would appear on both sides of the split
+tens of thousands of times. Molecule-level partitioning removes that but leaves
+close analogues --- an identical ring system bearing a different substituent
+--- free to straddle the split, and such series are abundant in
+PDB-derived sets. Partitioning on the Bemis--Murcko
+framework~\cite{bemis1996frameworks}, the convention adopted by
+MoleculeNet~\cite{wu2018moleculenet}, removes both: no validation molecule
+shares a ring system with any training molecule. The consequence is that
+held-out figures reported here are systematically lower than the
+random-partition figures conventionally quoted; that difference is the
+component of apparent performance attributable to memorised chemistry, and its
+suppression is the purpose of the exercise. Random partitions are known to
+overstate prospective performance for exactly this
+reason~\cite{sheridan2013timesplit}, and ligand-based benchmarks constructed
+without such control have been shown to reward memorisation over
+generalisation~\cite{wallach2018memorization}.
+
+Parents were canonicalised (RDKit~\cite{landrum2023rdkit}) before grouping, so
+that a molecule deposited under several equivalent notations forms one group
+rather than several that could be assigned to opposite sides. Groups were
+ordered by descending size with ties broken on the framework string, and
+assigned in that order to validation until the next group would exceed a 10\%
+budget, the remainder going to training; every pair inherits the fold of its
+parent. Of the 46{,}982 distinct parents recorded in the interaction-masked
+source --- counted before the masking-survival filter, and so a superset of
+the 41{,}474 quoted above --- 12{,}551 distinct frameworks were obtained. The three largest --- the acyclic
+class (6{,}754 molecules, 14.4\%), the Fe-porphyrin/haem framework (4{,}089,
+8.7\%) and the Mg-porphyrin/chlorophyll framework (2{,}393, 5.1\%) --- each
+exceed the validation budget and are consequently assigned to training, so
+validation is drawn from the diverse tail of small frameworks rather than from
+the crystallographically over-represented cores. This is the intended
+behaviour of a framework partition and not an artefact of the budget. A
+further 1{,}015 parents (2.2\%), whose SMILES exceed 400 characters and are
+predominantly peptide and oligosaccharide ligands, bypass the framework
+reduction and form singleton groups keyed on canonical SMILES; these are
+partitioned at molecule granularity, the conservative fallback.
+
+The partition is computed once over the complete parent set and cached as a
+manifest read by every Stage 10 variant. It is therefore independent of the
+per-parent instance cap, of any sub-sampling of the training pool and of the
+variant being run, so a molecule cannot change fold between runs and all
+implementations of Sec.~\ref{sec:stage10} agree on what is held out. A
+molecule absent from the manifest inherits the fold of its framework, and one
+whose framework is also absent defaults to training --- a direction that can
+never inflate a held-out score. Validation molecules were evaluated at the end
+of each epoch under the identical best-of-$K$ procedure with gradients
+disabled; the epoch attaining the lowest mean validation loss was retained as
+the final model; and property distributions are reported separately for
+training and held-out molecules, the difference between them being the
+memorisation measurement that the within-training diagnostics below cannot
+supply.
+
+\paragraph{Diagnostics.}
+Four quantities were logged per epoch and are the intended read-out of whether
+the objective is behaving as constructed: the mean of
+Eq.~\eqref{eq:stage10-total}; the mean of $\ell$ at the selected target; the
+\emph{candidate validity rate}, the fraction of all $K$ sampled completions
+that parse; and the \emph{fallback rate}, the fraction of molecules with
+$\mathcal{V}=0$. The last two are the diagnostic pair of interest. A run in
+which candidate validity rises while the novelty term of
+Eq.~\eqref{eq:stage10-loss} rises alongside it is one that is purchasing
+validity by memorising parents, and calls for a smaller
+$\lambda_{\mathrm{fb}}$; the intended behaviour is a falling fallback rate with
+the novelty term flat or falling.
+
+\begin{table}[htbp]
+\centering
+\caption{Stage 10 default hyperparameters. Entries shared with Stage 9
+(Table~\ref{tab:stage9-hparams}) are held identical by construction.}
+\label{tab:stage10-hparams}
+\begin{tabular}{@{}ll@{}}
+\toprule
+Parameter & Value \\
+\midrule
+Base model & ChemBERTa-zinc-base-v1~\cite{chithrananda2020chemberta} \\
+Trainable parameters & LM head $+$ last $N=1$ of 6 encoder blocks (7.7M / 44.1M, 17.5\%) \\
+Mask rate $p$ (\% of BPE tokens) & 15\% (shared with Stage 9) \\
+Decoding & one-shot (all masks in a single forward pass) \\
+Candidates per molecule $K$ & 16 \\
+Sampling top-$k$ / temperature $T$ & 20 / 1.2 (shared with Stage 9) \\
+Loss weights $(w_{\mathrm{QED}}, w_{\mathrm{SA}}, w_{\mathrm{nov}}, w_{\mathrm{alert}})$ & (0.30, 0.20, 0.30, 0.20), summing to $S=1$ \\
+Invalidity margin $w_{\mathrm{valid}}$ & 1.0 (an invalid candidate scores $S+w_{\mathrm{valid}}=2$) \\
+Parent-fallback weight $\lambda_{\mathrm{fb}}$ & 0.3 \\
+Unlikelihood weight $\lambda_{\mathrm{UL}}$ & 0.5 (variant 10a); 0 (variant 10b) \\
+Tox21 term $w_{\mathrm{tox21}}$ & not used (Stages 10, 10.1, 10.2); $0.20$ (Stage 10.4) \\
+Worst valid / invalid loss & $S=1$, $S+w_{\mathrm{valid}}=2$; Stage 10.4: $S'=1.2$, $2.2$ \\
+Train--validation partition & Bemis--Murcko framework, 10\% held out, seed 42 \\
+Model selection & epoch of lowest mean validation loss \\
+KL anchor & none (see text) \\
+Batch size & 16 \\
+Optimiser / learning rate & Adam / $5\times10^{-5}$ \\
+Gradient-norm clip & 1.0 \\
+Epochs & 4 \\
 \bottomrule
 \end{tabular}
 \end{table}

@@ -199,9 +199,13 @@ def detect_tpu() -> Optional[str]:
 def detect_environment() -> str:
     """Best-effort label for where this is running."""
     if os.environ.get("SLURM_JOB_ID"):
+        # Built by concatenation rather than a nested f-string expression:
+        # quoting a dict key inside an f-string that already uses that quote
+        # style is PEP 701 syntax and needs Python 3.12, but this project
+        # targets >=3.11 (pyproject, .python-version). Same output either way.
+        node = os.environ.get("SLURM_JOB_NODELIST")
         return (f"SLURM job {os.environ['SLURM_JOB_ID']}"
-                f"{' on ' + os.environ['SLURM_JOB_NODELIST']
-                   if os.environ.get('SLURM_JOB_NODELIST') else ''}")
+                + (f" on {node}" if node else ""))
     if os.environ.get("PBS_JOBID"):
         return f"PBS job {os.environ['PBS_JOBID']}"
     # The /content fallback is Linux-only on purpose: on Windows a leading
@@ -303,7 +307,7 @@ class HardwareProfile:
         n = self.cpu_count - 1
         if n <= 1:
             return 0
-        return min(n, 16)
+        return min(n, 64)
 
     @property
     def torch_threads(self) -> int:
@@ -381,35 +385,81 @@ class HardwareProfile:
         return max(min_batch, b)
 
     # ── application ───────────────────────────────────────────────────────
-    def apply(self, in_worker: bool = False) -> List[str]:
+    def apply(
+        self,
+        in_worker:        bool = False,
+        threads:          Optional[int] = None,
+        tf32:             Optional[bool] = None,
+        matmul_precision: Optional[str]  = None,
+    ) -> List[str]:
         """
         Push the derived settings into torch. Returns what changed, for logging.
 
         `in_worker=True` pins BLAS to a single thread: N pool workers each
         spawning M threads on an N-core allocation is the classic
         oversubscription that makes a parallel run slower than a serial one.
+
+        The three overrides exist so a CALLER can stay authoritative over its
+        own config while still using this profile for everything else. Each
+        defaults to None = "decide it from the hardware", which is the original
+        behaviour, so existing callers are unaffected:
+
+          threads           int  -> exactly this many intra-op threads
+                            0    -> leave torch's own default alone entirely
+          tf32              True/False -> force TF32 on or explicitly OFF.
+                            Passing False is not the same as omitting it: it
+                            WRITES allow_tf32 = False, which is what makes a
+                            caller's "no TF32" setting stick. Silently leaving
+                            it at torch's default is how a config flag ends up
+                            reported as off while the kernels still use it.
+          matmul_precision  "highest" | "high" | "medium" -> set explicitly,
+                            instead of the "high" that accompanies auto-TF32.
         """
         applied: List[str] = []
         if not _TORCH:
             return applied
 
-        threads = 1 if in_worker else self.torch_threads
-        try:
-            torch.set_num_threads(threads)
-            applied.append(f"torch threads = {threads}")
-        except Exception:
-            pass
-        if in_worker:
-            for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
-                os.environ[var] = "1"
-            applied.append("BLAS threads pinned to 1 (worker)")
+        if threads is None:
+            threads = 1 if in_worker else self.torch_threads
+        if threads:
+            try:
+                torch.set_num_threads(int(threads))
+                applied.append(f"torch threads = {int(threads)}")
+            except Exception:
+                pass
+        else:
+            applied.append("torch threads = untouched (torch default)")
 
-        if self.supports_tf32:
+        if in_worker:
+            n = "1" if threads is None else str(max(1, int(threads) or 1))
+            for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+                os.environ[var] = n
+            applied.append(f"BLAS threads pinned to {n} (worker)")
+
+        want_tf32 = self.supports_tf32 if tf32 is None else bool(tf32)
+        if want_tf32 and self.supports_tf32:
             try:
                 torch.backends.cuda.matmul.allow_tf32 = True
                 torch.backends.cudnn.allow_tf32 = True
-                torch.set_float32_matmul_precision("high")
                 applied.append("TF32 matmul enabled (cc >= 8.0)")
+            except Exception:
+                pass
+        elif tf32 is False:
+            # Explicit refusal: write it down rather than trusting the default.
+            try:
+                torch.backends.cuda.matmul.allow_tf32 = False
+                torch.backends.cudnn.allow_tf32 = False
+                applied.append("TF32 matmul explicitly DISABLED")
+            except Exception:
+                pass
+
+        prec = matmul_precision
+        if prec is None and want_tf32 and self.supports_tf32:
+            prec = "high"                # what auto-TF32 has always implied
+        if prec:
+            try:
+                torch.set_float32_matmul_precision(prec)
+                applied.append(f"float32 matmul precision = {prec}")
             except Exception:
                 pass
         return applied

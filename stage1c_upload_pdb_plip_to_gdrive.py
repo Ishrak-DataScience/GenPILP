@@ -103,8 +103,9 @@ from stage1b_large_scale_PLIP_mask_calculation import (
 try:
     from tqdm import tqdm
 except ImportError:
-    def tqdm(iterable=None, **kwargs):  # type: ignore[misc]
-        return iterable if iterable is not None else []
+    # A silent stand-in with the same call surface, tqdm.write included;
+    # the old inline stub was a bare function and had no .write.
+    from tqdm_compat import tqdm  # type: ignore[misc]
 
 
 MANIFEST_FIELDS = [

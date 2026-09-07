@@ -87,8 +87,9 @@ from typing import Dict, List, Optional, Set, Tuple
 try:
     from tqdm import tqdm
 except ImportError:  # graceful fallback — bar becomes a no-op
-    def tqdm(iterable, **kwargs):  # type: ignore
-        return iterable
+    # A silent stand-in with the same call surface, tqdm.write included;
+    # the old inline stub was a bare function and had no .write.
+    from tqdm_compat import tqdm  # type: ignore[misc]
 
 import config
 from rdkit import RDLogger as _RDLogger

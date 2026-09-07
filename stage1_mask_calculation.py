@@ -872,8 +872,15 @@ def generate_2d_interaction_plot(results: Dict[str, Any], output_path: str) -> N
         savefig_kwargs["pil_kwargs"] = {
             "quality": getattr(config, "MASK_CALC_PLOT_QUALITY", 85)
         }
-    plt.savefig(output_path, **savefig_kwargs)
-    plt.close()
+    try:
+        plt.savefig(output_path, **savefig_kwargs)
+    finally:
+        # close(fig), not close() — a bare close() drops the *current* figure,
+        # which is not necessarily this one, and on the savefig error path used
+        # to not run at all. Stage 1b keeps one worker process alive across
+        # thousands of ligands and swallows per-ligand exceptions, so a figure
+        # leaked here accumulates for the lifetime of the pool.
+        plt.close(fig)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -890,13 +897,26 @@ def run_pipeline(pdb_path: str,
                  mask_token: str = '<mask>',
                  out_prefix: Optional[str] = None,
                  serial_map_json: Optional[str] = None,
-                 mask_non_attractive: bool = False) -> Dict[str, Any]:
+                 mask_non_attractive: bool = False,
+                 save_meta: bool = True,
+                 save_plot: Optional[bool] = None,
+                 plot_path: Optional[str] = None) -> Dict[str, Any]:
     """
     Full Stage-1 pipeline:
         PDB + PLIP XML  →  meta dict  (+ optional .meta.json + interaction plot,
         see config.MASK_CALC_SAVE_PLOTS / MASK_CALC_PLOT_FORMAT / MASK_CALC_PLOT_DIR)
 
     The returned dict is the 'meta' object consumed by Stage 2.
+
+    save_meta / save_plot / plot_path give a CALLER per-invocation control over
+    the two side-effect artifacts, which were previously all-or-nothing on
+    out_prefix plus the process-global config.MASK_CALC_SAVE_PLOTS. Defaults
+    reproduce the previous behavior exactly (write the .meta.json whenever
+    out_prefix is set; plot iff config.MASK_CALC_SAVE_PLOTS is truthy), so
+    Stage 1's own main() is unaffected. Stage 1b needs the finer grain: it
+    masks ~500k binding sites and wants neither artifact for the bulk of them,
+    then re-runs a small random sample with both turned on (see that script's
+    D9). save_plot=None means "defer to config", True/False force it.
     """
     # 1) Parse PLIP interactions
     serial_to_types, smiles2pdb, plip_smiles = parse_plip_xml_v2_select(
@@ -1065,23 +1085,34 @@ def run_pipeline(pdb_path: str,
         "masked_atoms_detail": masked_atoms_detail,
     }
 
-    if out_prefix:
-        os.makedirs(os.path.dirname(out_prefix), exist_ok=True)
-        json_path = (os.path.splitext(out_prefix)[0]
-                     + f"_{resname}_{chain}_{resseq}.meta.json")
-        with open(json_path, 'w') as f:
-            json.dump(meta, f, indent=2)
-        print(f"  💾 JSON saved: {json_path}")
+    want_plot = (
+        bool(getattr(config, "MASK_CALC_SAVE_PLOTS", True))
+        if save_plot is None else bool(save_plot)
+    )
 
-        if getattr(config, "MASK_CALC_SAVE_PLOTS", True):
+    if out_prefix and (save_meta or want_plot):
+        os.makedirs(os.path.dirname(out_prefix), exist_ok=True)
+
+        if save_meta:
+            json_path = (os.path.splitext(out_prefix)[0]
+                         + f"_{resname}_{chain}_{resseq}.meta.json")
+            with open(json_path, 'w') as f:
+                json.dump(meta, f, indent=2)
+            print(f"  💾 JSON saved: {json_path}")
+
+        if want_plot:
             ext = getattr(config, "MASK_CALC_PLOT_FORMAT", "png").lower().lstrip(".")
-            plot_dir = getattr(config, "MASK_CALC_PLOT_DIR", None)
-            viz_name = os.path.basename(os.path.splitext(out_prefix)[0]) + f".2d_interactions.{ext}"
-            if plot_dir:
-                os.makedirs(plot_dir, exist_ok=True)
-                viz_path = os.path.join(plot_dir, viz_name)
+            if plot_path:
+                viz_path = plot_path
+                os.makedirs(os.path.dirname(viz_path) or ".", exist_ok=True)
             else:
-                viz_path = os.path.splitext(out_prefix)[0] + f".2d_interactions.{ext}"
+                plot_dir = getattr(config, "MASK_CALC_PLOT_DIR", None)
+                viz_name = os.path.basename(os.path.splitext(out_prefix)[0]) + f".2d_interactions.{ext}"
+                if plot_dir:
+                    os.makedirs(plot_dir, exist_ok=True)
+                    viz_path = os.path.join(plot_dir, viz_name)
+                else:
+                    viz_path = os.path.splitext(out_prefix)[0] + f".2d_interactions.{ext}"
             generate_2d_interaction_plot(meta, viz_path)
             print(f"  🖼  Plot saved: {viz_path}")
 

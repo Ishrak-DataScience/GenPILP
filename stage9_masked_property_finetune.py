@@ -136,6 +136,7 @@ import os
 import random
 import sys
 import tarfile
+import time
 import warnings
 from functools import lru_cache
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -176,8 +177,9 @@ if _SA_AVAILABLE:
 try:
     from tqdm import tqdm
 except ImportError:
-    def tqdm(iterable=None, **kwargs):          # type: ignore[misc]
-        return iterable if iterable is not None else range(0)
+    # A silent stand-in with the same call surface, tqdm.write included;
+    # the old inline stub was a bare function and had no .write.
+    from tqdm_compat import tqdm  # type: ignore[misc]
 
 # ── Optional: RDKit's built-in PAINS / Brenk structural-alert catalog ──────
 try:
@@ -2503,6 +2505,43 @@ def run_property_distribution_eval(
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  PROGRESS REPORTING (shared by Stage 9 and Stage 9.1)
+# ════════════════════════════════════════════════════════════════════════════
+
+def make_progress_reporter(pbar, total: int, interactive: bool, interval_s: float = 30.0):
+    """
+    Return report(step, text): updates pbar's postfix + count once per batch
+    without spamming the output when stdout isn't a real terminal.
+
+    A live terminal honours tqdm's \\r-overwrite, so the bar can refresh on
+    every batch there and still reads as one updating line -- that path is
+    untouched (refresh=False here just defers to pbar.update()'s own
+    mininterval throttle instead of forcing an extra redraw on top of it).
+
+    Redirected output (a SLURM .out file, `python ... > run.log`, a
+    CI/task-runner capture) has no terminal to interpret \\r -- every
+    refresh becomes its own line no matter how tqdm is configured, which is
+    what turns a 24000-batch run into 24000 lines of clutter. There, the
+    caller constructs pbar with disable=True and this instead writes ONE
+    plain status line at most every interval_s seconds (always at the final
+    step) via tqdm.write, which renders regardless of a bar's disable flag.
+    """
+    last = [0.0]
+
+    def report(step: int, text: str) -> None:
+        pbar.set_postfix_str(text, refresh=False)
+        pbar.update(1)
+        if interactive:
+            return
+        now = time.monotonic()
+        if now - last[0] >= interval_s or step >= total:
+            last[0] = now
+            tqdm.write(f"  [{step}/{total}] {text}")
+
+    return report
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  TRAINING LOOP
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -2604,12 +2643,19 @@ def run_stage9_finetuning(
     remaining_epochs = num_epochs - start_epoch + 1
     total_batches    = remaining_epochs * ((len(pairs) + batch_size - 1) // batch_size)
 
+    # A real terminal honours tqdm's \r-overwrite (one updating line); a
+    # redirected/log-captured run (SLURM .out, `> run.log`) has no terminal
+    # to interpret \r, so the live bar is disabled there and
+    # make_progress_reporter substitutes coarse, rate-limited status lines
+    # instead -- see its docstring.
+    _interactive = bool(getattr(sys.stdout, "isatty", lambda: False)())
     pbar = tqdm(
         total=total_batches, desc="Stage 9 property fine-tuning", unit="batch",
-        dynamic_ncols=True,
+        dynamic_ncols=True, disable=not _interactive,
         bar_format=("{l_bar}{bar}| {n_fmt}/{total_fmt} batches "
                     "[{elapsed}<{remaining}, {rate_fmt}] {postfix}"),
     )
+    report_progress = make_progress_reporter(pbar, total_batches, _interactive)
 
     for epoch in range(start_epoch, num_epochs + 1):
         rng.shuffle(pairs)
@@ -2695,15 +2741,14 @@ def run_stage9_finetuning(
             ep_kl.append(b_kl / b_masks if b_masks else 0.0)
             global_step += 1
 
-            pbar.set_postfix_str(
+            report_progress(
+                global_step,
                 f"ep={epoch}/{num_epochs}  score={mean_reward:.3f}  "
                 f"loss={batch_loss.item():.4f}  valid={ep_valid[-1]:.0%}  "
                 f"novelty={ep_novelty[-1]:.2f}  tox_free={ep_tox_free[-1]:.0%}  "
                 f"tox21={ep_tox21[-1]:.2f}  baseline={baseline:.3f}"
                 + (f"  kl/pos={ep_kl[-1]:.3f}" if kl_beta > 0 else ""),
-                refresh=True,
             )
-            pbar.update(1)
 
         def _avg(xs):
             return sum(xs) / max(len(xs), 1)
