@@ -1,0 +1,149 @@
+metadata binding sites : 109597
+unique PDB / lig / uniprot : 44273 / 20307 / 9658
+
+fda_status counts:
+fda_status
+-1.0       43
+ 0.0    87765
+ 0.5     2891
+ 1.0      243
+ 2.0     6223
+ 3.0     1715
+ 4.0    10717
+
+top 20 ligands (global freq):
+resname
+EDO    3633
+SO4    3359
+ADP    2884
+NAD    2734
+NAP    2623
+FAD    2448
+GDP    1843
+ATP    1768
+NDP    1230
+ACT    1223
+GTP    1212
+FMN    1120
+SAH    1107
+ANP    1014
+PO4    1004
+MG      946
+PLP     934
+CA      831
+DMS     815
+GNP     721
+
+top 20 targets (measurement count on THIS metadata.tsv):
+UniProt ID
+Unknown    2885
+P00918      897
+Q04771      724
+P56817      687
+O60885      558
+P03372      557
+P01116      539
+P30656      539
+P29476      534
+P68135      504
+P00760      497
+O76290      484
+P24941      460
+P00489      457
+P29274      424
+P00415      412
+Q6B856      400
+P19491      399
+P0DTD1      394
+Q38087      328
+
+emailed top-20 vs THIS file (rows here, 0 = absent):
+  UniProt     emailed    here
+  Unknown       14459    2885
+  P00918         1112     897
+  P29476         1095     534
+  D0VWR1          949       0
+  Q8DIQ1          831       0
+  P0DTD1          799     394
+  Q8DIF8          751       0
+  P00415          750     412
+  P02945          743       0
+  P0A405          724       0
+  P56817          718     687
+  Q7NDN8          707      66
+  P0A407          675       0
+  D0VWR7          627       0
+  P31224          569       2
+  P00396          539     179
+  P03372          532     557
+  P29274          526     424
+  P19491          494     399
+  P02768          466       8
+  -> 7 of the emailed top-20 are absent from this file: D0VWR1, Q8DIQ1, Q8DIF8, P02945, P0A405, P0A407, D0VWR7
+
+
+EXCLUSION FUNNEL (rows dropped by each filter, in order):
+  known_target           -6974
+  not_blocklisted        -49632
+  no_metal_interaction   -5800
+  interactions_ge5       -7042
+  real_pose              -14895
+  not_ubiquitous_le120   -411
+  fda_1to4               -22592
+  parsed                 -0
+  druglike_size          -214
+  mw_window              -25
+  organic_only           -19
+  low_charge             -3
+  has_ring               -6
+
+final candidate pool: 1382
+  unique targets: 344
+  unique ligands: 331
+  FDA==4: 817   FDA 1/2/3: 565
+
+candidate pool - targets by #candidate complexes (top 20):
+UniProt ID
+P03372    78
+P10275    50
+Q05769    34
+P00519    27
+P19793    27
+P15056    26
+P15121    21
+O60885    21
+P08235    20
+Q16539    20
+P06401    19
+P04150    18
+Q92731    17
+P37231    16
+O76074    16
+P29132    16
+P00520    15
+P24941    14
+P00533    14
+P11362    13
+
+candidate pool - ligands by #candidate complexes (top 20):
+resname
+TCL    74
+EST    58
+DHT    37
+STI    30
+9CR    27
+ROC    25
+STR    24
+KAI    20
+REA    19
+TES    18
+STL    18
+QUE    18
+ZMR    17
+ZST    17
+IMN    16
+DIF    16
+OHT    16
+0LI    15
+B49    13
+FOK    13

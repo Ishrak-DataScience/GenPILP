@@ -1115,8 +1115,18 @@ STAGE9_TOX21_AGGREGATION    = "mean"   # "mean" or "max" across STAGE9_TOX21_SEL
 
 # ── GNINA docking binary ───────────────────────────────────────────────────────
 # Stage 6 will auto-download if the binary is not found at this path.
+# v1.3.3 (CUDA 12.8 static, ~2.1 GB). Upgraded from v1.0.3 on 2026-09-17 at the
+# user's request. NOTE: v1.3 moved CNN scoring to Torch and RETRAINED the scoring
+# functions on CrossDock2020 v1.3, so CNNaffinity/CNNscore from this binary are
+# NOT comparable with numbers produced by v1.0.3 -- any earlier Stage 6 result you
+# still care about has to be re-docked, not merged. The binary also needs a
+# compute-node driver new enough for CUDA 12.8; the older-CUDA build is
+# https://github.com/gnina/gnina/releases/download/v1.3.2/gnina.1.3.2
+# Stage 6 copies the binary to a session-local path before every run (Colab/Drive
+# cannot execve a FUSE path), which at ~2.1 GB is noticeably slower than v1.0.3's
+# 306 MB -- expect the copy, not the docking, to dominate a short Stage 6 run.
 GNINA_BINARY       = GNINA_BINARY = f"{BASE_DIR}/gnina"
-GNINA_DOWNLOAD_URL = "https://github.com/gnina/gnina/releases/download/v1.0.3/gnina"
+GNINA_DOWNLOAD_URL = "https://github.com/gnina/gnina/releases/download/v1.3.3/gnina.cuda12.8.static"
 # ── Stage 1 ligands ────────────────────────────────────────────────────────────
 PIPELINE_INPUTS = [
     {"pdb_path": BASE_PDB_PATH + "4QZS", "plip_xml_path": BASE_XML_PATH + "4QZS",
@@ -1227,6 +1237,45 @@ STAGE1B_RETRY_ERRORS       = False
 # below). Changing it re-rolls WHICH binding sites get plotted without redoing
 # any masking -- useful for spot-checking a fresh sample via --plot-only.
 STAGE1B_PLOT_SEED          = 42
+
+# ── Baseline analysis (baseline_analysis/*.py) ────────────────────────────────
+# Vanilla-ChemBERTa baseline: pick interesting complexes, mask each parent three
+# ways at <=BASELINE_MASK_PERCENT% of its BPE tokens, refill with the UNtuned
+# model, then redock parent + predictions and compare. See baseline_analysis/README.md.
+#
+# Pre-computed Stage 1b NON-INTERACTION (PLIP--, --mode 2) mask corpus: a
+# directory or .tar/.tar.gz holding stage1b_large_scale_plip_mask_summary.csv.
+# The PLIP++ pool is that row's per-molecule COMPLEMENT (all atoms minus the
+# non-interacting ones), which is how Stage 1 builds mode 2 in the first place,
+# so this one corpus feeds both PLIP arms and neither needs a fresh PLIP run.
+STAGE1B_PLIP_NEGATIVE_MASK_DIR = "/group/bioinf_tmp/masked_plip/"
+BASELINE_DIR              = f"{_OUT}/baseline_analysis/"
+BASELINE_N_COMPLEXES      = 24      # complexes selected from metadata.tsv
+BASELINE_N_SEEDS          = 5       # predictions per complex per arm
+# Mask budget, identical for all three arms: floor(pct/100 * n_bpe_tokens) atom
+# indices drawn from that arm's pool, so no arm ever exceeds the budget and an
+# arm whose pool is smaller (PLIP++ usually is) simply masks its whole pool.
+BASELINE_MASK_PERCENT     = MASK_PERCENT
+BASELINE_MASK_SEED        = 42      # atom-draw seed; per (complex, arm, k) derived from it
+BASELINE_GEN_SEED         = 1000    # MLM sampling seed; per (complex, arm, k) derived from it
+BASELINE_TOP_K            = 20      # MLM decoding, matches Stage 9/9a TOP_K
+BASELINE_TEMPERATURE      = 1.2     # MLM decoding, matches Stage 9/9a TEMPERATURE
+BASELINE_GNINA_NUM_MODES  = 9       # poses GNINA returns per ligand
+BASELINE_GNINA_EXHAUSTIVENESS = 8   # GNINA default; raise for a slower, tighter search
+BASELINE_GNINA_SEED       = 42      # GNINA --seed, so docking itself is reproducible
+# GNINA for the baseline. Same version as GNINA_DOWNLOAD_URL above (both v1.3.3
+# since 2026-09-17), kept as its own knob for two reasons: the baseline can be
+# moved to a different build without touching Stage 6, and it carries a FALLBACK.
+#   primary  : CUDA 12.8 static build -- needed for H100/sm_90 (Capella), fine on
+#              A100, but requires a driver new enough for CUDA 12.8.
+#   fallback : v1.3.2's default build, compiled against an older CUDA for
+#              compatibility with older drivers. Same v1.3 scoring functions, so
+#              results stay comparable between the two.
+# baseline_analysis/get_gnina.sh tries the primary, verifies it actually runs,
+# and falls back automatically. run_docking.py records `gnina --version` in the
+# manifest, because v1.0.3 and v1.3.x scores must never be mixed in one table.
+BASELINE_GNINA_URL = "https://github.com/gnina/gnina/releases/download/v1.3.3/gnina.cuda12.8.static"
+BASELINE_GNINA_URL_FALLBACK = "https://github.com/gnina/gnina/releases/download/v1.3.2/gnina.1.3.2"
 
 # ── Stage 1c: upload local PDB/PLIP pairs to Google Drive ────────────────────
 # Same eligibility rule as Stage 1b: only pdb_ids present as BOTH

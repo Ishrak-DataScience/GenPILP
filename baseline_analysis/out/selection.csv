@@ -1,0 +1,25 @@
+id,pdb_id,resname,chain,resseq,UniProt ID,fda_status,target_measurements,lig_global_count,total_complex_interactions,hbonds_count,hydrophobics_count,pistacks_count,pications_count,sbridges_count,halogens_count,wbridge_count,heavy,mw,logp,hbd,hba,rotb,rings,arom,qed,fsp3,charge,plip_neg_pool_bpe,smiles,target_name,lig_name
+1ERR:RAL:B:600,1err,RAL,B,600,P03372,4.0,557.0,11,19,2,13,2,0,1,0,1,34,473.6,6.08,2,6,7,5,4,0.319,0.25,0,11.0,c1cc(O)cc2c1c(C(=O)c1ccc(OCCN3CCCCC3)cc1)c(-c1ccc(O)cc1)s2,Estrogen receptor alpha,Raloxifene
+3ERD:DES:A:600,3erd,DES,A,600,P03372,4.0,557.0,10,14,3,9,1,0,0,0,1,20,268.4,4.83,2,2,4,2,2,0.78,0.222,0,5.0,CCC(c1ccc(O)cc1)=C(c1ccc(O)cc1)CC,Estrogen receptor alpha,Diethylstilbestrol
+3ADX:IMN:A:2,3adx,IMN,A,2,P37231,4.0,314.0,29,14,3,7,2,0,2,0,0,25,357.8,3.93,1,3,4,3,3,0.768,0.158,0,7.0,c12ccc(OC)cc1c(CC(=O)O)c(C)n2C(c1ccc(Cl)cc1)=O,PPAR-gamma,Indomethacin
+4LZR:LOC:A:201,4lzr,LOC,A,201,O60885,4.0,558.0,5,11,2,5,0,0,0,0,4,29,399.4,2.87,1,6,5,3,2,0.833,0.364,0,18.0,O=C(C)N[C@@H]1c2cc(=O)c(OC)ccc2-c2c(cc(OC)c(OC)c2OC)CC1,BRD4 bromodomain,BRD4 ligand (check)
+3VN2:TLS:A:501,3vn2,TLS,A,501,P37231,4.0,314.0,1,21,1,17,3,0,0,0,0,39,514.6,7.26,1,3,7,6,6,0.243,0.182,0,8.0,c12cc(-c3nc4c(n3C)cccc4)cc(C)c1nc(CCC)n2Cc1ccc(-c2c(C(=O)O)cccc2)cc1,PPAR-gamma,Telmisartan
+3PWW:ROC:A:1001,3pww,ROC,A,1001,P11838,4.0,317.0,26,28,7,12,1,0,2,0,6,49,670.9,3.09,5,7,12,5,3,0.198,0.5,0,40.0,C(=O)(c1nc2ccccc2cc1)N[C@H](C(=O)N[C@H]([C@H](O)CN1[C@H](C(=O)N[C@](C)(C)C)C[C@@H]2CCCC[C@@H]2C1)Cc1ccccc1)CC(=O)N,T. brucei ... (check),Ritonavir
+3HEG:BAX:A:1,3heg,BAX,A,1,Q16539,4.0,270.0,10,15,4,10,0,0,0,1,0,32,464.8,5.55,3,4,5,3,3,0.461,0.095,0,15.0,c1c(NC(Nc2ccc(Oc3cc(C(NC)=O)ncc3)cc2)=O)ccc(Cl)c1[C@@](F)(F)F,p38-alpha MAPK,BIRB-796 / Doramapimod
+3U5K:08J:A:1,3u5k,08J,A,1,O60885,4.0,558.0,7,10,1,8,0,0,0,0,1,23,325.8,4.32,0,2,1,4,3,0.655,0.111,0,11.0,c12cc(Cl)ccc1-n1c(C)ncc1CN=C2c1ccccc1F,BRD4 bromodomain,BRD4 fragment (check)
+5HIE:P06:D:801,5hie,P06,D,801,P15056,4.0,141.0,11,17,4,10,1,2,0,0,0,35,519.6,5.36,2,7,5,4,4,0.367,0.174,0,18.0,c1(N)nc(-c2c(-c3c(F)c(N[S@@](c4c(F)cccc4F)(=O)=O)ccc3)nc([C@@](C)(C)C)s2)ccn1,BRAF kinase,BRAF inhibitor (check)
+4RZV:032:A:801,4rzv,032,A,801,P15056,4.0,141.0,5,19,6,11,2,0,0,0,0,33,489.9,4.83,1,5,7,4,2,0.565,0.174,0,11.0,c1(Cl)ccc(C2=CC3=C(C(c4c(F)ccc(N[S@](=O)(=O)CCC)c4F)=O)C=NC3=NC2)cc1,BRAF kinase,BRAF inhibitor (check)
+3LN1:CEL:A:682,3ln1,CEL,A,682,Q05769,4.0,107.0,10,14,5,8,0,0,0,1,0,26,381.4,3.51,1,3,3,3,3,0.754,0.118,0,14.0,[S@](c1ccc(-n2c(-c3ccc(C)cc3)cc([C@@](F)(F)F)n2)cc1)(N)(=O)=O,COX-2 (PTGS2),Celecoxib
+1QTI:GNT:A:600,1qti,GNT,A,600,P04058,4.0,181.0,10,14,3,7,0,0,0,0,4,21,287.4,1.85,1,4,1,4,1,0.801,0.529,0,21.0,C1=C[C@H](O)C[C@H]2[C@@]13CCN(C)Cc1ccc(OC)c(c13)O2,Acetylcholinesterase (Torpedo),Galanthamine-like
+1S2C:FLF:A:2001,1s2c,FLF,A,2001,P42330,4.0,174.0,9,11,1,5,2,0,2,0,1,20,281.2,4.15,2,2,3,2,2,0.888,0.071,0,8.0,c1(C(O)=O)ccccc1Nc1cc([C@](F)(F)F)ccc1,Aldo-keto reductase 1C3,Flufenamic acid
+3TI1:B49:A:299,3ti1,B49,A,299,P24941,4.0,460.0,20,14,5,8,0,0,1,0,0,29,398.5,2.98,2,4,7,3,1,0.694,0.409,0,13.0,CC1=NC(C=C2c3c(ccc(F)c3)NC2=O)=C(C)C1C(NCCN(CC)CC)=O,CDK2,CDK2 inhibitor
+4I22:IRE:A:9001,4i22,IRE,A,9001,P00533,4.0,319.0,10,12,1,6,0,0,1,2,2,31,446.9,4.28,1,7,8,4,3,0.518,0.364,0,11.0,C1COCCN1CCCOc1c(OC)cc2c(c1)c(Nc1cc(Cl)c(F)cc1)ncn2,EGFR kinase,Gefitinib (Iressa)
+3R43:ID8:A:332,3r43,ID8,A,332,P42330,4.0,174.0,6,11,1,5,2,0,2,0,1,18,241.3,3.75,2,2,3,2,2,0.86,0.133,0,4.0,OC(=O)c1ccccc1Nc1c(C)c(C)ccc1,Aldo-keto reductase 1C3,AKR1C3 inhibitor
+1XKK:FMM:A:91,1xkk,FMM,A,91,P00533,4.0,319.0,2,13,1,8,1,0,0,2,1,40,581.1,6.14,2,8,11,5,5,0.179,0.172,0,15.0,C[S@](=O)(=O)CCNCc1ccc(-c2ccc3ncnc(Nc4ccc(OCc5cccc(F)c5)c(Cl)c4)c3c2)o1,EGFR kinase,Lapatinib
+1U65:CP0:A:603,1u65,CP0,A,603,P04058,4.0,181.0,1,13,3,6,3,0,0,0,1,43,584.7,3.62,1,8,4,7,4,0.362,0.455,0,18.0,n1c2c(c(CC)c3cn4c(c13)cc1c(c4=O)=COC(=O)[C@]1(O)CC)cc(OC(=O)N1CC[C@@H](N3CCCCC3)CC1)cc2,Acetylcholinesterase (Torpedo),AChE inhibitor
+3H0A:9RA:A:500,3h0a,9RA,A,500,P19793,4.0,89.0,2,17,1,14,0,0,1,0,1,26,348.5,6.1,1,1,3,3,2,0.727,0.375,0,10.0,O=C(O)c1ccc(C(=C)c2c(C)cc3c(c2)[C@](C)(C)CC[C@@]3(C)C)cc1,Retinoid X receptor alpha,retinoid
+4RRW:LUR:C:705,4rrw,LUR,C,705,Q05769,4.0,107.0,16,11,3,8,0,0,0,0,0,20,293.7,4.16,2,2,4,2,2,0.89,0.133,0,9.0,OC(=O)Cc1cc(C)ccc1Nc1c(Cl)cccc1F,COX-2 (PTGS2),Lumiracoxib
+4R1V:3E8:A:1401,4r1v,3E8,A,1401,P08581,4.0,101.0,1,15,2,10,1,0,0,0,2,37,492.6,4.01,0,7,7,5,4,0.385,0.276,0,11.0,c1(-c2nn(Cc3cc(-c4ncc(OC[C@@H]5CCN(C)CC5)cn4)ccc3)c(=O)cc2)cc(C#N)ccc1,,
+3G4L:ROF:C:903,3g4l,ROF,C,903,Q08499,4.0,291.0,8,11,1,3,0,0,0,1,6,26,403.2,5.03,1,4,7,3,2,0.705,0.294,0,15.0,O=C(c1ccc(O[C@@H](F)F)c(OC[C@@H]2CC2)c1)Nc1c(Cl)cncc1Cl,,
+1N5X:TEI:A:3006,1n5x,TEI,A,3006,P80457,4.0,73.0,2,13,4,7,1,0,1,0,0,22,316.4,3.72,1,5,5,2,2,0.908,0.312,0,6.0,s1c(-c2cc(C#N)c(OC[C@@H](C)C)cc2)nc(C)c1C(=O)O,,
+4NCT:2K2:C:501,4nct,2K2,C,501,Q13627,4.0,207.0,4,12,1,10,0,0,0,0,1,43,568.6,6.24,0,4,3,9,6,0.253,0.229,0,40.0,O=C1N=Cc2c1c1c3c4c2c2ccccc2n4[C@]2(C)[C@H](OC)[C@H](N(C)C(=O)c4ccccc4)C[C@H](n3c3ccccc13)O2,,
