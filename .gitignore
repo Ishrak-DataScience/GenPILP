@@ -27,3 +27,7 @@ tox21.csv
 outputs/
 # Large generated result files (exceed GitHub 100MB limit)
 experiments/**/stage9a_per_molecule.csv
+
+# Baseline upload bundle (build artifact: regenerate from baseline_analysis/out)
+genplip_baseline_bundle.zip
+genplip_baseline_bundle/
