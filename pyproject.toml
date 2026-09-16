@@ -1,7 +1,7 @@
 [project]
 name = "genplip"
 version = "0.1.0"
-description = "BRD4-GenAI: structure-aware molecular generation and docking pipeline (stage0a-stage9a)"
+description = "GenPLIP: protein-ligand-interaction-guided molecular generation with ChemBERTa"
 requires-python = ">=3.11"
 dependencies = [
     "torch>=2.0",
@@ -11,6 +11,7 @@ dependencies = [
     "pandas>=2.0",
     "numpy>=1.26",
     "matplotlib>=3.7",
+    "scipy>=1.11",
     "tqdm>=4.65",
     "peft>=0.11",
     "torchao>=0.16.0",

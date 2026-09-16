@@ -4,7 +4,7 @@ stage6_docking.py
 =================
 Stage 6 of the pipeline — molecular docking + score visualisation.
 
-Uses GNINA (v1.0.3) with autobox to dock all generated molecules from
+Uses GNINA (config.GNINA_DOWNLOAD_URL; v1.3.3 since 2026-09-17) with autobox to dock all generated molecules from
 Stage 2 into the BRD4 binding pocket defined by the original ligand
 in each PDB structure.
 
@@ -87,7 +87,7 @@ HOW TO RUN  (Colab)
 
 HOW TO RUN  (local Linux)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  wget https://github.com/gnina/gnina/releases/download/v1.0.3/gnina
+  wget -O gnina https://github.com/gnina/gnina/releases/download/v1.3.3/gnina.cuda12.8.static
   chmod +x gnina   # then set config.GNINA_BINARY to its absolute path
   python stage6_docking.py
 
@@ -157,6 +157,22 @@ def _download_gnina(dest_path: str, url: str) -> None:
 # Local execution path: Google Drive (Colab FUSE) cannot execute binaries.
 # We always copy the Drive binary here before running it.
 _GNINA_LOCAL = "/content/gnina"
+
+
+def _gnina_label() -> str:
+    """
+    Version string for chart labels, read from config.GNINA_DOWNLOAD_URL.
+
+    Hard-coding it meant every figure kept claiming "v1.0.3" after the binary
+    was upgraded, which mislabels published output rather than merely going
+    stale in a comment. Derived from the URL rather than by running the binary,
+    because plotting must not depend on GNINA being present.
+    """
+    url = getattr(config, "GNINA_DOWNLOAD_URL", "") or ""
+    for part in url.split("/"):
+        if part.startswith("v") and part[1:2].isdigit():
+            return part
+    return "version unknown"
 
 
 def _make_executable(path: str) -> None:
@@ -1027,7 +1043,7 @@ def _make_barchart_figure(
     fig.text(
         0.72, 0.025,
         "Ranking: CNNaffinity (primary) + Vinardo (tiebreak)\n"
-        "Best pose (pose 1) per molecule | GNINA v1.0.3",
+        f"Best pose (pose 1) per molecule | GNINA {_gnina_label()}",
         fontsize=6.5, color="#888888", style="italic", ha="left", va="center",
     )
 
@@ -1344,7 +1360,7 @@ def main():
   binding pocket using GNINA with autobox, then produces ranking plots.
 
   GNINA binary : {config.GNINA_BINARY}
-  (Auto-downloaded from GitHub v1.0.3 if not found.)
+  (Auto-downloaded from config.GNINA_DOWNLOAD_URL -- v1.3.3 -- if not found.)
 
   ⚠️  GNINA is Linux/x86_64 only. On macOS / Windows use WSL.
   ⚠️  GPU (CUDA) is strongly recommended; CPU docking is very slow.

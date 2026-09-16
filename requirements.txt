@@ -9,6 +9,7 @@ selfies>=2.1
 pandas>=2.0
 numpy>=1.26
 matplotlib>=3.7
+scipy>=1.11          # baseline_analysis/analyze.py: Wilcoxon / Friedman tests
 tqdm>=4.65
 peft>=0.11
 torchao>=0.16.0

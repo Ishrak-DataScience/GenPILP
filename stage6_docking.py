@@ -4,7 +4,7 @@ stage6_docking.py
 =================
 Stage 6 of the pipeline — molecular docking + score visualisation.
 
-Uses GNINA (v1.0.3) with autobox to dock all generated molecules from
+Uses GNINA (config.GNINA_DOWNLOAD_URL; v1.3.3 since 2026-09-17) with autobox to dock all generated molecules from
 Stage 2 into the BRD4 binding pocket defined by the original ligand
 in each PDB structure.
 
@@ -88,7 +88,7 @@ HOW TO RUN  (Colab)
 
 HOW TO RUN  (local Linux)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  wget https://github.com/gnina/gnina/releases/download/v1.0.3/gnina
+  wget -O gnina https://github.com/gnina/gnina/releases/download/v1.3.3/gnina.cuda12.8.static
   chmod +x gnina   # then set config.GNINA_BINARY to its absolute path
   python stage6_docking.py
 
@@ -1211,7 +1211,7 @@ def main():
   binding pocket using GNINA with autobox, then produces ranking plots.
 
   GNINA binary : {config.GNINA_BINARY}
-  (Auto-downloaded from GitHub v1.0.3 if not found.)
+  (Auto-downloaded from config.GNINA_DOWNLOAD_URL -- v1.3.3 -- if not found.)
 
   ⚠️  GNINA is Linux/x86_64 only. On macOS / Windows use WSL.
   ⚠️  GPU (CUDA) is strongly recommended; CPU docking is very slow.
