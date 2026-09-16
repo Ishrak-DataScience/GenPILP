@@ -1,0 +1,23 @@
+% ============================================================================
+% Abstract -- compact variant (~200 words, Nature-style single paragraph)
+% ============================================================================
+
+Masked language models pretrained on SMILES reduce de novo design to local,
+token-level editing: mask part of a known ligand and resample it. We ask
+whether the choice of \emph{which} tokens to mask carries structural
+information, masking the atoms PLIP identifies as making protein--ligand
+contacts in deposited co-crystal structures and comparing against uniformly
+random masking of the same parents at the same rate. Because the pretrained
+model infills such masks with low chemical fidelity, we fine-tune ChemBERTa
+against a composite, non-differentiable objective over validity, drug-likeness,
+synthetic accessibility, scaffold divergence, structural alerts and predicted
+Tox21 activity, using two estimators as a controlled comparison: a REINFORCE
+policy gradient with LoRA adapters and a KL anchor, and best-of-$K$ selection
+followed by cross-entropy. Initial results are encouraging but preliminary ---
+over three epochs, parseable generations rose from 20.9\% to 22.7\% and mean
+composite reward from 0.101 to 0.110, with absolute validity still low. Part of
+that ceiling appears to reflect the corpus rather than the objective: three
+frameworks account for 28\% of distinct parents and crystallisation additives
+for a quarter of all instances. We evaluate on a Bemis--Murcko framework
+partition, and ongoing work targets generalisation across chemically diverse
+molecular groups.

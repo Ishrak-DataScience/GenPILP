@@ -1,0 +1,43 @@
+% ============================================================================
+% Abstract
+% \input{abstract} inside \begin{abstract} ... \end{abstract}
+% ============================================================================
+
+Masked language models pretrained on SMILES offer a route to de novo molecular
+design that needs no task-specific generative training: masking selected tokens
+of a known ligand and resampling them reduces generation to local, token-level
+editing of an existing scaffold. We ask whether the choice of \emph{which}
+tokens to mask carries structural information, by masking the atoms that PLIP
+identifies as participating in protein--ligand contacts in deposited
+co-crystal structures and comparing against uniformly random masking of the
+same parent molecules at the same rate, so that the two arms differ only in
+mask placement. Because the pretrained model infills such masks with low
+chemical fidelity, we fine-tune ChemBERTa against a composite, non-differentiable
+objective over RDKit validity, drug-likeness, synthetic accessibility,
+divergence from the parent scaffold, PAINS/Brenk structural alerts, and
+predicted Tox21 activity from a multitask classifier fine-tuned on the same
+backbone. Two estimators are implemented as a controlled comparison --- a
+REINFORCE policy gradient with LoRA adapters and an exact KL anchor to the
+pretrained policy, and best-of-$K$ selection followed by ordinary
+cross-entropy --- with the training pairs, masking rate, rollout distribution
+and scoring code held fixed between them.
+
+Initial results are encouraging but preliminary. Across three epochs of
+policy-gradient fine-tuning the fraction of infilled molecules that parse rose
+from 20.9\% to 22.7\% and the mean composite reward from 0.101 to 0.110, with
+the drug-likeness, accessibility and novelty terms improving in step and the
+policy held near 2 nats per masked position from its pretrained distribution.
+Absolute validity remains low, and the gain is modest against the range the
+objective defines.
+
+Part of that ceiling appears attributable to the composition of the training
+corpus rather than to the objective. PDB-derived ligand sets are dominated by
+a few chemotypes: the acyclic, Fe-porphyrin and Mg-porphyrin frameworks alone
+account for 28\% of distinct parent molecules, and crystallisation additives
+--- sulfate and glycerol --- for a quarter of all deposited instances. We
+therefore deduplicate to one pair per distinct parent and evaluate on a
+Bemis--Murcko framework partition, under which no held-out molecule shares a
+ring system with any training molecule, reporting training and held-out
+distributions separately. Ongoing work is directed at making the model
+generalise across chemically diverse molecular groups rather than at improving
+aggregate numbers on this skewed distribution.
