@@ -48,18 +48,44 @@ by 0.05-0.10 on a normalised metric. That gap is the measurement, not a
 regression: it is the part of apparent performance that was memorised
 chemistry.
 
-THE THREE BIG GROUPS, AND WHY THEY LAND IN TRAIN
---------------------------------------------------
+THE THREE BIG GROUPS, AND WHY THE ASSIGNMENT IS SIZE-BLIND
+----------------------------------------------------------
     acyclic (no ring system)   6,754 molecules   14.4%
     Fe-porphyrin / heme        4,089 molecules    8.7%
     Mg-porphyrin / chlorophyll 2,393 molecules    5.1%
 
-Groups are filled largest-first, and a group that does not FIT in the
-remaining validation budget goes to train. At a 10% validation fraction all
-three exceed it and land in train, leaving validation to be built from the
-diverse tail of small scaffolds. That is the desirable outcome and it is not a
-coincidence -- it is the standard scaffold-split behaviour, which deliberately
-validates on the rare chemistry rather than on the crystallography.
+Three groups hold 28% of the data, so HOW groups are dealt out matters as much
+as how they are formed. Until this was fixed, groups were filled largest-first
+and a group that did not FIT the remaining budget fell to train. On the real
+data that produced:
+
+    train 37,327 (90.0%, 12,735 groups)   val 4,147 (10.0%, 4 GROUPS)
+
+-- a 10% validation fold made of FOUR scaffold families. Its effective sample
+size was 4, not 4,147, and every number computed on it described those four
+chemistries rather than the model. Held-out candidate validity sat at 4.6%
+against 37.9% on train FROM EPOCH 1, which is a property of the two folds and
+not something training could have caused.
+
+The rule now: shuffle the groups uniformly and deal them out until the fold's
+molecule budget is met, TAKING the group that crosses it rather than skipping
+it. Skipping is what made size matter -- a group could only be held out if it
+fitted, so the big families could never be. Taking it costs an overshoot of at
+most one group and buys the property the estimate rests on: a group's chance of
+being held out does not depend on how big it is. Typical outcome on this data
+is ~1,200 validation groups instead of 4.
+
+The residual is second-order and worth stating rather than hiding: a group
+still perturbs the budget it is measured against, so its inclusion probability
+differs from a singleton's by roughly its own share of all molecules -- about
+3% relative for the largest group here, against the 100% of the old rule.
+Self-test [5] measures it rather than asserting it.
+
+Size-blind does not mean low-variance. Draw one of the three big families into
+validation and it alone is 15-60% of the fold; that is a legitimate draw and
+the honest answer is to SEE it, so describe() reports the largest held-out
+group's share and warns past 25%. Reseeding on fold COMPOSITION is legitimate;
+reseeding after seeing a model metric is not.
 
 STABILITY
 ---------
@@ -142,6 +168,14 @@ MANIFEST   = getattr(config, "STAGE10_SPLIT_MANIFEST", "") or ""
 # SMILES instead, which is 1,015 of 46,982 molecules (2.2%) and costs only that
 # those few are split at molecule granularity rather than scaffold.
 MAX_SCAFFOLD_SMILES_LEN = 400
+
+# Bumped whenever the FOLD ASSIGNMENT changes. It rides in the fingerprint, so
+# a manifest built under an older rule is REBUILT rather than silently reused.
+# Without it a fix to assign_folds is invisible on every machine that already
+# has a cached manifest -- which is every machine that has trained.
+#   1  largest-group-first, skip what does not fit  (biased; see the header)
+#   2  uniform shuffle, take the group that crosses the budget
+SPLIT_ALGORITHM = 2
 
 _FOLDS = ("train", "val", "test")
 
@@ -228,25 +262,52 @@ def assign_folds(by_group: Dict[str, List[str]],
     """
     canonical SMILES -> "train" | "val" | "test", whole groups together.
 
-    Largest group first. A group that does not FIT in the remaining validation
-    (then test) budget goes to train, so the big families -- acyclic, heme,
-    chlorophyll -- end up training data and the folds are built from the
-    diverse tail. Validating on the rare chemistry rather than on the
-    crystallography is the point of a scaffold split, not a side effect.
+    SIZE-BLIND. Groups are dealt out in UNIFORM RANDOM ORDER, and the group
+    that crosses a fold's molecule budget is TAKEN rather than skipped. Both
+    halves of that sentence are load-bearing, and this function used to get
+    both wrong.
 
-    DETERMINISTIC ACROSS MACHINES. Groups are ordered by (size descending, key
-    ascending), so ties break identically everywhere; `seed` only shuffles
-    within a size class, before that sort. A split that moved between runs
-    would silently invalidate every comparison made against it -- including a
-    resumed run's own earlier epochs.
+    WHY ORDER MUST NOT BE SIZE. The previous rule sorted by size descending, so
+    a group's fold was a deterministic function of how big it was: the largest
+    groups had probability 0 of being held out and the smallest had ~1. On this
+    data three scaffold families hold 28% of the molecules, and a 10% fold came
+    out as FOUR groups covering 4,147 molecules -- effective n of 4. A number
+    computed there describes those four chemistries, not the model.
+
+    WHY THE CROSSING GROUP IS TAKEN, NOT SKIPPED. Skipping is the subtler half
+    of the same bug. If a group is held out only when it FITS the remaining
+    budget, then inclusion depends on the group's own size and big families are
+    systematically pushed to train -- milder than sorting by size, but the same
+    defect. Taking it makes inclusion depend only on what came BEFORE the group
+    in the shuffle, which is independent of the group itself. The cost is that
+    a fold overshoots its budget by at most one group.
+
+    WHAT REMAINS, STATED RATHER THAN HIDDEN. This is not exactly uniform. A
+    group is held out iff the groups preceding it in the shuffle total less
+    than the budget, and the pool of "other groups" is missing the group being
+    considered -- so its probability differs from a singleton's by roughly its
+    own share of all molecules. For the largest group here that is ~3% relative
+    (0.10 vs 0.103); the rule it replaces was 0.00 vs 0.25. Self-test [5]
+    MEASURES this rather than assuming it.
+
+    SIZE-BLIND IS NOT LOW-VARIANCE, and no assignment can make it so on data
+    where three groups hold 28% of the molecules. Draw one of them into
+    validation and it alone is most of the fold; that is a legitimate draw, not
+    a bug, and the answer is to see it -- describe() reports the largest
+    held-out group's share and warns past 25%.
+
+    DETERMINISTIC ACROSS MACHINES. Keys are sorted before the seeded shuffle,
+    so dict insertion order cannot leak in and the same data gives the same
+    folds everywhere. A split that moved between runs would silently invalidate
+    every comparison made against it, including a resumed run's own earlier
+    epochs.
     """
     val_frac  = VAL_FRAC  if val_frac  is None else val_frac
     test_frac = TEST_FRAC if test_frac is None else test_frac
     rng = random.Random(SPLIT_SEED if seed is None else seed)
 
-    keys = list(by_group)
-    rng.shuffle(keys)                          # ties only; the sort dominates
-    keys.sort(key=lambda k: (-len(by_group[k]), k))
+    keys = sorted(by_group)                # sort first: dict order must not
+    rng.shuffle(keys)                      # leak into a "random" order
 
     n_total = sum(len(v) for v in by_group.values())
     n_val   = int(math.floor(n_total * val_frac))
@@ -256,56 +317,11 @@ def assign_folds(by_group: Dict[str, List[str]],
     n_in = {"train": 0, "val": 0, "test": 0}
     for key in keys:
         members = by_group[key]
-        if n_in["val"] + len(members) <= n_val:
+        # "< budget", not "+ len(members) <= budget": the group that crosses
+        # the line goes in. That is the whole fix -- see the docstring.
+        if n_in["val"] < n_val:
             fold = "val"
-        elif n_test and n_in["test"] + len(members) <= n_test:
-            fold = "test"
-        else:
-            fold = "train"
-        n_in[fold] += len(members)
-        for m in members:
-            folds[m] = fold
-    return folds
-
-
-def assign_folds_random(by_group: Dict[str, List[str]],
-                        val_frac: float = None,
-                        test_frac: float = None,
-                        seed: int = None) -> Dict[str, str]:
-    """
-    Shuffle the groups and slice off the folds -- the conventional random
-    split, for comparison against the scaffold one.
-
-    WHY THIS IS NOT assign_folds WITH SIZE-1 GROUPS. assign_folds orders by
-    (size descending, key ascending); when every group holds one molecule the
-    size term is constant and the order collapses to alphabetical by canonical
-    SMILES. Validation would then be "every molecule whose SMILES sorts first"
-    -- all the Br- and C-prefixed ones together -- which is a systematic
-    partition wearing a random split's name, and would read as a strangely bad
-    random baseline. Shuffling is what makes the comparison against
-    "scaffold" mean what it is supposed to mean.
-
-    Still deterministic given `seed`: the shuffle is seeded and the group keys
-    are sorted first, so the same data yields the same folds on every machine.
-    """
-    val_frac  = VAL_FRAC  if val_frac  is None else val_frac
-    test_frac = TEST_FRAC if test_frac is None else test_frac
-    rng = random.Random(SPLIT_SEED if seed is None else seed)
-
-    keys = sorted(by_group)            # sort first: dict order must not leak in
-    rng.shuffle(keys)
-
-    n_total = sum(len(v) for v in by_group.values())
-    n_val   = int(math.floor(n_total * val_frac))
-    n_test  = int(math.floor(n_total * test_frac))
-
-    folds: Dict[str, str] = {}
-    n_in = {"train": 0, "val": 0, "test": 0}
-    for key in keys:
-        members = by_group[key]
-        if n_in["val"] + len(members) <= n_val:
-            fold = "val"
-        elif n_test and n_in["test"] + len(members) <= n_test:
+        elif n_in["test"] < n_test:
             fold = "test"
         else:
             fold = "train"
@@ -320,7 +336,8 @@ def _fingerprint(n_parents: int, val_frac: float, test_frac: float,
     """What the cached manifest is only valid for."""
     return {"n_parents": int(n_parents), "val_frac": float(val_frac),
             "test_frac": float(test_frac), "seed": int(seed), "mode": str(mode),
-            "max_scaffold_smiles_len": MAX_SCAFFOLD_SMILES_LEN}
+            "max_scaffold_smiles_len": MAX_SCAFFOLD_SMILES_LEN,
+            "algorithm": SPLIT_ALGORITHM}
 
 
 def build_split(parents: Sequence[str], val_frac: float = None,
@@ -329,17 +346,20 @@ def build_split(parents: Sequence[str], val_frac: float = None,
     """
     Group `parents` and assign folds. Returns the manifest dict.
 
-    Three modes, in decreasing order of how much leakage they remove:
+    A mode chooses the GROUPING and nothing else. One size-blind assignment
+    then deals those groups out, so "scaffold vs random" compares one thing
+    rather than two. Three modes, in decreasing order of leakage removed:
 
         "scaffold"  group by Murcko core; whole groups move together. The
                     default and the only one whose held-out number is a
                     generalisation estimate.
-        "molecule"  one group per canonical SMILES, still assigned
-                    largest-group-first. Identical parents cannot straddle,
-                    but analogues can.
-        "random"    one group per canonical SMILES, assigned by SHUFFLING.
-                    Identical parents still cannot straddle -- canonicalisation
-                    sees to that -- but nothing else is controlled.
+        "molecule"  one group per canonical SMILES. Identical parents cannot
+                    straddle, but analogues can.
+        "random"    identical to "molecule" in construction -- they differ only
+                    in what the banner and the manifest filename say, and
+                    "random" says the loud thing. Identical parents still
+                    cannot straddle, canonicalisation sees to that, but nothing
+                    else is controlled.
 
     "random" exists to be COMPARED AGAINST "scaffold", not to replace it. The
     difference between the two held-out numbers is the share of apparent
@@ -370,14 +390,29 @@ def build_split(parents: Sequence[str], val_frac: float = None,
                 by_mol[canon] = "mol:" + canon
                 by_group["mol:" + canon] = [canon]
 
-    if mode == "random":
-        folds = assign_folds_random(by_group, val_frac, test_frac, seed)
-    else:
-        folds = assign_folds(by_group, val_frac, test_frac, seed)
+    # One assignment for every mode. There used to be a second one for
+    # "random", and it existed only because this one ordered by size and, over
+    # size-1 groups, that degenerated to alphabetical -- a systematic partition
+    # wearing a random split's name. A size-blind assignment needs no such
+    # workaround, and having two would put a second difference inside a
+    # comparison designed to isolate one.
+    folds = assign_folds(by_group, val_frac, test_frac, seed)
     counts = {f: sum(1 for v in folds.values() if v == f) for f in _FOLDS}
     group_counts = {
         f: len({by_mol[m] for m, v in folds.items() if v == f}) for f in _FOLDS
     }
+    # The largest group on each side. describe() needs it to say whether the
+    # held-out fold is one chemistry wearing a fold's name -- rare under a
+    # size-blind deal, but no assignment can make it impossible on data where
+    # three groups hold 28% of the molecules.
+    fold_of_group: Dict[str, str] = {}
+    for mol, f in folds.items():
+        fold_of_group.setdefault(by_mol[mol], f)
+    fold_max_group = {f: 0 for f in _FOLDS}
+    for key, members in by_group.items():
+        f = fold_of_group.get(key)
+        if f is not None and len(members) > fold_max_group[f]:
+            fold_max_group[f] = len(members)
     return {
         "format": 1,
         "mode": mode,
@@ -386,6 +421,7 @@ def build_split(parents: Sequence[str], val_frac: float = None,
         "n_groups": len(by_group),
         "counts": counts,
         "group_counts": group_counts,
+        "fold_max_group": fold_max_group,
         "folds": folds,
     }
 
@@ -574,6 +610,25 @@ def describe(man: Dict[str, object], pairs_split=None) -> List[str]:
         f"val {c['val']:,} ({c['val']/total:.1%}, {g.get('val', 0):,} groups)"
         + (f"   test {c['test']:,} ({c['test']/total:.1%})" if c["test"] else ""),
     ]
+    # The fold's SHAPE, not just its size. A held-out number is only as good
+    # as the diversity of what it was measured on, and that is invisible from
+    # the molecule count alone -- the run that motivated this line reported a
+    # healthy "val 4,147 (10.0%)" over four scaffold groups.
+    mx = (man.get("fold_max_group") or {}).get("val", 0)
+    if mx and c["val"]:
+        share = mx / c["val"]
+        lines.append(f"                    held-out fold spans "
+                     f"{g.get('val', 0):,} group(s); its largest is {mx:,} "
+                     f"molecule(s) ({share:.0%})")
+        if share > 0.25:
+            lines.append("                    WARNING: one group dominates "
+                         "the held-out fold, so its numbers")
+            lines.append("                    describe that chemistry more "
+                         "than the model. Change")
+            lines.append("                    STAGE10_SPLIT_SEED and rebuild. "
+                         "Reseeding on fold COMPOSITION")
+            lines.append("                    is legitimate; reseeding after "
+                         "seeing a model metric is not.")
     if man["mode"] == "scaffold":
         lines.append("                    no validation molecule shares a "
                      "Murcko scaffold with a training one")
@@ -643,16 +698,60 @@ def _run_self_test() -> None:
     assert len(bm) == 1, f"two notations of toluene became {len(bm)} entries"
     print("  [4] two notations of one molecule collapse to one entry    OK")
 
-    # 5. Big groups go to TRAIN, not to val -- so val is the diverse tail.
-    big = ["c1ccccc1" + "C" * i for i in range(1, 21)]      # 20 benzenes
-    small = ["C1CCCCC1", "C1CCOCC1", "c1ccncc1", "C1CCNCC1"]
-    m2 = build_split(big + small, val_frac=0.20, test_frac=0.0, seed=1)
-    assert all(m2["folds"][canonical(b)] == "train" for b in big), (
-        "the 20-member group is bigger than a 20% fold of 24 and must not fit "
-        "in val")
-    assert any(m2["folds"][canonical(s)] == "val" for s in small), \
-        "val should have been filled from the small groups"
-    print("  [5] oversized groups fall to train; val gets the tail      OK")
+    # 5. THE FOLD IS SIZE-BLIND -- the property the whole estimate rests on.
+    #    If a group's chance of being held out depended on how big it is, the
+    #    validation fold would be a biased sample of chemistry and the number
+    #    computed on it would not estimate anything.
+    #
+    #    MEASURED over 2,000 seeds, not asserted by construction, because the
+    #    guarantee is probabilistic: one 12-member group against 40 singletons,
+    #    and the big group must be held out about as often as a small one.
+    #    Theory says 0.244 vs 0.216 -- the residual second-order term the
+    #    docstring quantifies. The rule this replaced scored 0.000 vs 0.250: it
+    #    could not put the big group in validation at all, which is exactly how
+    #    a 10% fold of the real data came out as four scaffold groups.
+    synth = {"big": ["b%d" % i for i in range(12)]}
+    synth.update({"s%d" % i: ["m%d" % i] for i in range(40)})
+    trials = 2000
+    hits = {"big": 0, "s0": 0}
+    for s in range(trials):
+        f5 = assign_folds(synth, val_frac=0.20, test_frac=0.0, seed=s)
+        for key in hits:
+            if f5[synth[key][0]] == "val":
+                hits[key] += 1
+    p_big, p_small = hits["big"] / trials, hits["s0"] / trials
+    assert abs(p_big - p_small) < 0.08, (
+        "held-out probability depends on group size (big=%.3f small=%.3f) -- "
+        "the validation fold is a biased sample of chemistry"
+        % (p_big, p_small))
+    assert p_big > 0.10, (
+        "a 12-member group reached validation only %.3f of the time -- large "
+        "groups are still being excluded from the fold" % p_big)
+    print("  [5] fold membership is size-blind (big %.2f vs small %.2f)  OK"
+          % (p_big, p_small))
+
+    # 5b. THE OBSERVED REGRESSION, reproduced exactly. Eight 25-member
+    #     families whose sizes sum to precisely the 10% budget, against 800
+    #     singletons. Largest-first packs the budget with four of the families
+    #     and then has no room left, so validation came out as FOUR GROUPS --
+    #     which is what the real run reported over 41,474 molecules. The
+    #     numbers are chosen so the old rule scores 4 here; a weaker layout
+    #     (one huge family plus singletons) scores 100 under BOTH rules and
+    #     would not have caught anything.
+    synth2 = {"g%d" % g: ["x%d_%d" % (g, i) for i in range(25)]
+              for g in range(8)}
+    synth2.update({"s%d" % i: ["y%d" % i] for i in range(800)})
+    ngroups = []
+    for s in range(50):
+        f5b = assign_folds(synth2, val_frac=0.10, test_frac=0.0, seed=s)
+        ngroups.append(len([k for k, ms in synth2.items()
+                            if f5b[ms[0]] == "val"]))
+    typical = sorted(ngroups)[len(ngroups) // 2]
+    assert typical > 20, (
+        "the median validation fold holds %d group(s) -- a fold that small is "
+        "the collapse this rule exists to prevent" % typical)
+    print("  [5b] folds span many groups (median %d of 808, was 4)      OK"
+          % typical)
 
     # 6. Pair splitting keeps every instance of a parent together.
     pairs = [("m1", "c1ccccc1C"), ("m2", "c1ccccc1C"), ("m3", "c1ccccc1CC"),
@@ -713,8 +812,9 @@ def _run_self_test() -> None:
     print("  [10] molecule mode = one group per molecule                OK")
 
     # 11. random mode: still deterministic, still no identical parent on both
-    #     sides, but NOT scaffold-disjoint -- and it must differ from the
-    #     alphabetical order that assign_folds would have produced.
+    #     sides, but NOT scaffold-disjoint. The exact fold size also pins
+    #     the budget rule: over size-1 groups nothing can overshoot, so a
+    #     25% fold of 24 must be exactly 6.
     many = ["c1ccccc1" + "C" * i for i in range(1, 13)] + \
            ["C1CCOCC1" + "C" * i for i in range(1, 13)]
     r1 = build_split(many, val_frac=0.25, test_frac=0.0, seed=5, mode="random")
@@ -729,16 +829,23 @@ def _run_self_test() -> None:
     print(f"  [11] random mode: reproducible, seed-sensitive, {n_val}/"
           f"{len(many)} in val   OK")
 
-    # 12. THE POINT OF assign_folds_random: with size-1 groups, assign_folds
-    #     degenerates to alphabetical order, which is a systematic partition
-    #     wearing a random split's name. The two must not agree.
+    # 12. molecule and random now BUILD THE SAME SPLIT, and that is the fix
+    #     rather than a regression. They diverged only because assign_folds
+    #     ordered by size and, over size-1 groups, that degenerated to
+    #     alphabetical -- so a second function existed to shuffle instead. One
+    #     size-blind assignment serves every mode, and the only thing a mode
+    #     chooses is the GROUPING, which is the only thing it should ever have
+    #     chosen: otherwise "scaffold vs random" varies two things at once.
     m_mol = build_split(many, val_frac=0.25, test_frac=0.0, seed=5,
                         mode="molecule")
-    assert m_mol["folds"] != r1["folds"], (
-        "random and molecule modes produced the SAME split -- then "
-        "assign_folds_random is not actually shuffling, and the 'random' "
-        "baseline would be an alphabetical one")
-    print("  [12] random != molecule (shuffle really shuffles)           OK")
+    assert m_mol["folds"] == r1["folds"], (
+        "molecule and random group identically -- one canonical SMILES per "
+        "group -- and share one assignment, so they must agree")
+    sc = build_split(many, val_frac=0.25, test_frac=0.0, seed=5,
+                     mode="scaffold")
+    assert sc["n_groups"] < m_mol["n_groups"], (
+        "scaffold mode must group analogues together, unlike molecule mode")
+    print("  [12] modes differ only by grouping, not by assignment       OK")
 
     # 13. Identical parents still cannot straddle in random mode: grouping is
     #     on the canonical SMILES, so the two notations of one molecule are
