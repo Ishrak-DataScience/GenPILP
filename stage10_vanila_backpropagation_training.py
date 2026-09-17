@@ -206,6 +206,45 @@ def alert_rate_from_loss(tox_alert_term: float) -> float:
     return float(tox_alert_term) / W_TOX_ALERT
 
 
+# ── Loss terms back to the properties they were computed from ────────────────
+# Each series in `history` is a WEIGHTED LOSS TERM averaged over an epoch's
+# molecules, which is what the objective uses but not what anyone reads a
+# property plot for. The three inversions below are exact, because each term is
+# weight x property averaged linearly, and they follow alert_rate_from_loss
+# exactly in one further respect: a candidate that was invalid, or that RDKit
+# could not measure, was charged the FULL weight upstream, so it re-enters here
+# at the worst value of its property (QED 0, SA 10, novelty 0). That is stated
+# on every figure that uses them, because a curve that folds in a ~70% invalid
+# rate otherwise reads as a claim about the molecules that were valid.
+
+def qed_from_loss(qed_term: float) -> float:
+    """Mean QED (0-1, higher better); invalid candidates counted as 0."""
+    if W_QED <= 0:
+        return float("nan")
+    return 1.0 - float(qed_term) / W_QED
+
+
+def sa_from_loss(sa_term: float) -> float:
+    """Mean SA score on its native 1-10 scale (lower = easier to make);
+    invalid candidates counted as 10."""
+    if W_SA <= 0:
+        return float("nan")
+    return 1.0 + 9.0 * (float(sa_term) / W_SA)
+
+
+def novelty_from_loss(novelty_term: float) -> float:
+    """
+    Mean novelty, 1 - Tanimoto(parent, candidate), 0-1 higher better.
+
+    The stored term penalises SIMILARITY, so this is the complement; invalid
+    candidates were charged full weight and therefore count as novelty 0, i.e.
+    as identical to the parent.
+    """
+    if W_NOVELTY <= 0:
+        return float("nan")
+    return 1.0 - float(novelty_term) / W_NOVELTY
+
+
 def ensure_history_keys(history: Dict[str, list]) -> Dict[str, list]:
     """
     Widen a RESUMED history to the current key set, in place.
@@ -813,6 +852,7 @@ def run_stage10_training(
             tqdm.write(line)
     _plot_history(history, save_dir, variant)
     _plot_tox_alert_rate(history, save_dir, variant)
+    _plot_validation_properties(history, save_dir, variant)
     return history
 
 
@@ -820,15 +860,21 @@ def _plot_history(history: Dict[str, list], save_dir: str, variant: str) -> None
     """Training curves. Loss DESCENDS here, unlike Stage 9's ascending score."""
     if not history.get("epoch"):
         return
-    fig, axes = plt.subplots(2, 3, figsize=(16, 8))
+    fig, axes = plt.subplots(2, 4, figsize=(21, 8))
     ep = history["epoch"]
+    # Every loss term the objective carries gets a panel. "sa" was tracked in
+    # HISTORY_KEYS and written every epoch but never drawn, so synthetic
+    # accessibility -- one of the four properties the objective optimises --
+    # was the only one with no curve at all, on either fold.
     panels = [
-        ("loss_mean",       "Training loss (backprop)",        "#1f77b4"),
-        ("best_loss_mean",  "Best-candidate composite loss",   "#d62728"),
-        ("cand_valid_rate", "Candidate validity rate",         "#2ca02c"),
-        ("fallback_rate",   "Parent-fallback rate",            "#ff7f0e"),
-        ("novelty",         "Novelty loss term (lower = more novel)", "#9467bd"),
-        ("qed",             "QED loss term (lower = more drug-like)", "#8c564b"),
+        ("loss_mean",        "Training loss (backprop)",        "#1f77b4"),
+        ("best_loss_mean",   "Best-candidate composite loss",   "#d62728"),
+        ("cand_valid_rate",  "Candidate validity rate",         "#2ca02c"),
+        ("fallback_rate",    "Parent-fallback rate",            "#ff7f0e"),
+        ("qed",              "QED loss term (lower = more drug-like)", "#8c564b"),
+        ("sa",               "SA loss term (lower = easier to make)",  "#17becf"),
+        ("novelty",          "Novelty loss term (lower = more novel)", "#9467bd"),
+        ("best_valid_rate",  "Selected-target validity rate",   "#7f7f7f"),
     ]
     for a, (key, title, color) in zip(axes.flat, panels):
         a.plot(ep, history.get(key, []), marker="o", color=color, label="train")
@@ -852,6 +898,97 @@ def _plot_history(history: Dict[str, list], save_dir: str, variant: str) -> None
     plt.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
     tqdm.write(f"  Training curves saved : {out}")
+
+
+def _plot_validation_properties(history: Dict[str, list], save_dir: str,
+                                variant: str) -> None:
+    """
+    The four properties the objective optimises, on the HELD-OUT fold:
+    QED, candidate validity, novelty and synthetic accessibility.
+
+    _plot_history draws the raw weighted loss terms, on axes shared with the
+    training curve, which is the right figure for "is the objective going
+    down". It is the wrong figure for "are the held-out molecules any good":
+    the terms are weighted, three of the four are inverted with respect to the
+    property, and the held-out curve is a dashed overlay on a training-scaled
+    axis. This figure answers the second question directly -- each property on
+    its own native scale, held-out solid, training faint behind it, with the
+    direction of improvement stated per panel.
+
+    Every value is recovered from the stored loss term (see qed_from_loss,
+    sa_from_loss, novelty_from_loss), so it is exactly the quantity the
+    objective saw -- INCLUDING invalid candidates at their worst value. With a
+    ~70% fallback rate that matters, and the caption says so.
+
+    Silently does nothing when the run recorded no validation pass (the fold is
+    configurable off), rather than drawing an empty frame.
+    """
+    ep = history.get("epoch") or []
+    if not ep:
+        return
+
+    def series(key, conv=None):
+        raw = history.get(key) or []
+        if len(raw) != len(ep):
+            return None
+        out = []
+        for v in raw:
+            try:
+                x = float(v)
+            except (TypeError, ValueError):
+                out.append(float("nan"));  continue
+            out.append(x if conv is None else conv(x))
+        return out if any(x == x for x in out) else None
+
+    panels = [
+        ("QED", "val_qed", "qed", qed_from_loss, "higher = more drug-like",
+         (0.0, 1.0), "#8c564b"),
+        ("Candidate validity", "val_cand_valid_rate", "cand_valid_rate",
+         lambda v: 100.0 * v, "higher = more parseable molecules",
+         (0.0, 100.0), "#2ca02c"),
+        ("Novelty vs parent", "val_novelty", "novelty", novelty_from_loss,
+         "higher = less like the parent", (0.0, 1.0), "#9467bd"),
+        ("Synthetic accessibility", "val_sa", "sa", sa_from_loss,
+         "lower = easier to synthesise", (1.0, 10.0), "#17becf"),
+    ]
+
+    drawn = 0
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    for ax, (title, vkey, tkey, conv, direction, ylim, color) in zip(axes.flat, panels):
+        val = series(vkey, conv)
+        train = series(tkey, conv)
+        if train is not None:
+            ax.plot(ep, train, marker="o", markersize=4, color=color, alpha=0.30,
+                    linewidth=1.2, label="training")
+        if val is not None:
+            ax.plot(ep, val, marker="s", color=color, linewidth=2, label="held-out")
+            drawn += 1
+        ax.set_title(f"{title}\n{direction}", fontsize=10)
+        ax.set_xlabel("Epoch")
+        ax.set_ylim(*ylim)
+        if len(ep) <= 20:
+            ax.set_xticks(list(ep))
+        ax.grid(True, linestyle="--", alpha=0.4)
+        ax.legend(fontsize=8, loc="best")
+
+    if drawn == 0:
+        plt.close(fig)
+        tqdm.write("  (no held-out series in history; validation-property "
+                   "figure skipped)")
+        return
+
+    fig.suptitle(f"Stage 10{variant} -- held-out molecule properties per epoch",
+                 fontsize=13)
+    fig.text(0.5, -0.02,
+             "Recovered from the weighted loss terms, so candidates that were "
+             "invalid or could not be measured are included at their worst "
+             "value (QED 0, novelty 0, SA 10).",
+             ha="center", fontsize=8, color="#555555")
+    plt.tight_layout()
+    out = os.path.join(save_dir, f"stage10{variant}_validation_properties.png")
+    plt.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    tqdm.write(f"  Held-out property curves saved : {out}")
 
 
 def _plot_tox_alert_rate(history: Dict[str, list], save_dir: str,

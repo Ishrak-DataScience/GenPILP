@@ -212,6 +212,55 @@ def run_self_test() -> None:
         print(f"  [7{variant}] end-to-end run + checkpoint + resume (variant "
               f"{variant})   OK")
 
+    # ── 8. held-out property figure ───────────────────────────────────────
+    # The four properties the objective optimises must all be PLOTTED on the
+    # validation fold, not merely recorded. "sa" was tracked every epoch and
+    # drawn nowhere, so synthetic accessibility had no curve on either fold;
+    # this pins all four against that regression.
+    for term, prop, expect in (("qed", s10.qed_from_loss, 0.62),
+                               ("sa", s10.sa_from_loss, 3.40),
+                               ("novelty", s10.novelty_from_loss, 0.41)):
+        weight = {"qed": s10.W_QED, "sa": s10.W_SA,
+                  "novelty": s10.W_NOVELTY}[term]
+        if term == "sa":
+            encoded = weight * ((expect - 1) / 9)
+        else:
+            encoded = weight * (1 - expect)
+        assert abs(prop(encoded) - expect) < 1e-9, (term, prop(encoded), expect)
+    # An invalid candidate was charged the full weight, so it must re-enter at
+    # the worst value of its property rather than at zero loss.
+    assert abs(s10.qed_from_loss(s10.W_QED)) < 1e-9
+    assert abs(s10.sa_from_loss(s10.W_SA) - 10.0) < 1e-9
+    assert abs(s10.novelty_from_loss(s10.W_NOVELTY)) < 1e-9
+    print("  [8] loss terms invert to QED / SA / novelty exactly; full weight "
+          "-> worst value   OK")
+
+    hist = s10.new_history()
+    hist["epoch"] = [1, 2, 3]
+    for key in hist:
+        if key != "epoch":
+            hist[key] = [0.3, 0.29, 0.28]
+    with tempfile.TemporaryDirectory() as td:
+        s10._plot_history(hist, td, "b")
+        s10._plot_validation_properties(hist, td, "b")
+        made = set(os.listdir(td))
+        assert "stage10b_validation_properties.png" in made, made
+        assert "stage10b_training_curves.png" in made, made
+        for f in made:
+            assert os.path.getsize(os.path.join(td, f)) > 5000, f
+    # A run configured without a validation fold must skip the figure rather
+    # than emit an empty frame.
+    bare = s10.new_history()
+    bare["epoch"] = [1, 2]
+    for key in bare:
+        if key != "epoch":
+            bare[key] = [] if key.startswith("val_") else [0.3, 0.3]
+    with tempfile.TemporaryDirectory() as td:
+        s10._plot_validation_properties(bare, td, "b")
+        assert "stage10b_validation_properties.png" not in os.listdir(td)
+    print("  [9] held-out QED/validity/novelty/SA figure written; skipped "
+          "cleanly when no validation fold ran   OK")
+
     print("Stage 10 self-test passed.")
 
 

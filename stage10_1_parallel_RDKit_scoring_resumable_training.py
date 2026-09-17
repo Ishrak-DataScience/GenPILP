@@ -1006,6 +1006,7 @@ def run_stage10_1_training(
     # filename and the title, so "1a" would read "stage101a".
     s10._plot_history(history, save_dir, f".1{variant}")
     s10._plot_tox_alert_rate(history, save_dir, f".1{variant}")
+    s10._plot_validation_properties(history, save_dir, f".1{variant}")
     return history
 
 

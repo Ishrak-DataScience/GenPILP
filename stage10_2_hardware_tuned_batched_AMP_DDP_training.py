@@ -1493,6 +1493,7 @@ def run_stage10_2_training(
         # filename and the title, so "2a" would read "stage102a".
         s10._plot_history(history, save_dir, f".2{variant}")
         s10._plot_tox_alert_rate(history, save_dir, f".2{variant}")
+        s10._plot_validation_properties(history, save_dir, f".2{variant}")
     ddp_cleanup(is_dist)
     return history
 

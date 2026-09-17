@@ -1251,6 +1251,7 @@ def run_stage10_4_training(
         # filename and the title, so "3a" would read "stage103a".
         s10._plot_history(history, save_dir, f".4{variant}")
         s10._plot_tox_alert_rate(history, save_dir, f".4{variant}")
+        s10._plot_validation_properties(history, save_dir, f".4{variant}")
         _plot_tox21_clean(history, save_dir, f".4{variant}")
         _plot_toxicity_comparison(history, save_dir, f".4{variant}")
         _plot_loss_split(history, save_dir, f".4{variant}")
