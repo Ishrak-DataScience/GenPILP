@@ -136,6 +136,7 @@ import os
 import random
 import sys
 import tarfile
+import textwrap
 import time
 import warnings
 from functools import lru_cache
@@ -1578,6 +1579,7 @@ def evaluate_property_records(
     pairs_by_source: Dict[str, List[Tuple[str, str]]],
     top_k:           int   = TOP_K,
     temperature:     float = TEMPERATURE,
+    source_order:    Sequence[str] = None,
 ) -> Dict[str, List[Dict[str, object]]]:
     """
     Generate one completion per (masked, original) pair and measure it with
@@ -1594,6 +1596,12 @@ def evaluate_property_records(
     instead of invalid molecules injecting fake zeros into every
     distribution.
 
+    `source_order` names the sources to score, in the order they are scored;
+    it defaults to the two built-in ones. Scripts that define their own arms
+    pass their own keys -- stage9a_masking_mode_comparison.py compares three
+    masking modes through this same function, which is the point: the arms
+    must be measured by identical code or the comparison measures the code.
+
     Downstream: summarize_property_records, write_property_records_csv,
     plot_property_report.
     """
@@ -1602,7 +1610,7 @@ def evaluate_property_records(
 
     records_by_source: Dict[str, List[Dict[str, object]]] = {}
     n_gen_failed = 0
-    for source in _SOURCE_ORDER:
+    for source in tuple(source_order or _SOURCE_ORDER):
         pairs = pairs_by_source.get(source)
         if not pairs:
             continue
@@ -2166,7 +2174,10 @@ def plot_property_report(
         tqdm.write("  Every panel was omitted -- nothing to plot.")
         return
 
-    ncols = min(3, len(panels))
+    # Four panels lay out 2x2, not 3-then-1: a lone panel on its own row wastes
+    # two cells and leaves the four panels narrower than a two-column grid would
+    # have made them. Any other count keeps the up-to-three-columns rule.
+    ncols = 2 if len(panels) == 4 else min(3, len(panels))
     nrows = (len(panels) + ncols - 1) // ncols
     fig   = plt.figure(figsize=(6.6 * ncols, 5.0 * nrows))
     outer = fig.add_gridspec(nrows, ncols, hspace=0.55, wspace=0.26)
@@ -2271,7 +2282,13 @@ def plot_property_report(
                 ax.axhline(ref_y, color="#555555", linestyle=":", linewidth=1.4)
                 note += f"\ndotted line: {ref_label}"
             ax.set_xticks(range(len(series)))
-            ax.set_xticklabels([label_of[s] for s in series], fontsize=8)
+            # Abbreviated once the panel is crowded, for the reason the stats
+            # box abbreviates: three full series names under three bars run
+            # into each other, and overlapping labels are worse than short
+            # ones. Series with no short name fall back to the full one, so a
+            # caller that set none sees no change.
+            ax.set_xticklabels([(short_of if compact else label_of)[s]
+                                for s in series], fontsize=8)
             ax.set_xlim(-0.7, len(series) - 0.3)      # keep a lone bar from spanning the panel
             ax.set_ylim(0, 1.0)
             ax.set_ylabel("Fraction of generated molecules")
@@ -2347,7 +2364,8 @@ def plot_property_report(
                 ax.text(0.5, 0.5, "no valid molecules", transform=ax.transAxes,
                         ha="center", va="center", fontsize=10, color="#888888")
             ax.set_xticks(pos)
-            ax.set_xticklabels([label_of[s] for s in series], fontsize=8)
+            ax.set_xticklabels([(short_of if compact else label_of)[s]
+                                for s in series], fontsize=8)
             ax.set_ylim(-0.03, 1.02)
             ax.set_ylabel("1 - Tanimoto(parent, generated)")
             ax.set_title("Scaffold novelty vs. parent  --  valid molecules only", fontsize=10.5)
@@ -2434,15 +2452,37 @@ def plot_property_report(
     # drawn ABOVE the axes box subplots_adjust positions and are what the
     # legend collides with if only the legend's own height is reserved.
     head_in  = 0.42 + 0.28 * leg_rows + 0.34
-    foot_in  = 0.95 if footer else 0.25
+
+    # The footer is wrapped HERE rather than by matplotlib's wrap=True, so its
+    # line count is known before the space for it is reserved. wrap=True wraps
+    # at draw time, after subplots_adjust has already committed to a fixed
+    # strip at the bottom -- so a footer longer than that strip grew upward
+    # over the bottom row's x-labels and panels instead of pushing them up.
+    # It also breaks mid-word, which this does not.
+    #
+    # ~18 characters per inch is 8pt text at an average glyph width of half
+    # the point size; it only has to be close, since the reservation and the
+    # wrapping use the SAME number and therefore agree with each other.
+    footer_lines: List[str] = []
+    if footer:
+        per_line = max(40, int(fig.get_figwidth() * 18))
+        for para in footer.split("\n"):
+            footer_lines.extend(textwrap.wrap(para, per_line) or [""])
+    # 0.165 in per 8pt footer line (11.9pt of leading), on top of 0.55 in for
+    # what hangs BELOW the axes box that subplots_adjust positions: the tick
+    # labels and a two-line x-label ("SA-Score ... / solid line = mean, dashed
+    # = median"), which is what reached down into the footer when only the
+    # footer's own height was reserved. Never less than the 0.95 in the
+    # short-footer figures were tuned at.
+    foot_in = max(0.95, 0.55 + 0.165 * len(footer_lines)) if footer else 0.25
 
     if handles:
         fig.legend(handles, legend_labels, loc="upper center", ncol=leg_cols,
                    bbox_to_anchor=(0.5, 1.0 - 0.36 / fig_h), frameon=False, fontsize=10)
     fig.suptitle(suptitle, y=1.0 - 0.11 / fig_h, fontsize=13)
     if footer:
-        fig.text(0.5, 0.16 / fig_h, footer, ha="center", va="bottom", fontsize=8,
-                 color="#444444", wrap=True)
+        fig.text(0.5, 0.16 / fig_h, "\n".join(footer_lines), ha="center",
+                 va="bottom", fontsize=8, color="#444444")
 
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     fig.subplots_adjust(top=1.0 - head_in / fig_h, bottom=foot_in / fig_h)

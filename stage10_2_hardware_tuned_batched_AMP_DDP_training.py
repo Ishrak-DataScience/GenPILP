@@ -150,6 +150,20 @@ Usage
 
 from __future__ import annotations
 
+# FIRST, above torch and transformers: torchao logs a register_constant()
+# deprecation while it is being imported, and a filter installed after that
+# import has nothing left to catch. See quiet_torch_logs for what it drops and
+# what it deliberately does not.
+#
+# Guarded because this module only makes the LOG tidier. A checkout that is
+# missing it -- a partial sync, a `git commit -am` that skipped the untracked
+# file -- must still train; dying at import over two suppressed warning lines
+# would be the worst possible trade.
+try:
+    import quiet_torch_logs  # noqa: F401
+except ImportError:
+    pass
+
 import multiprocessing as mp
 import os
 import random
@@ -1462,6 +1476,13 @@ def run_stage10_2_training(
                     batch_index=0, global_step=global_step, history=history,
                     agg=_fresh_agg(), n_steps=0, fingerprint=fp,
                     rng=_rng_state(), profile=profile, provenance=provenance)
+                # Figures redrawn from the history that was just checkpointed,
+                # so the PNGs on disk track the run epoch by epoch instead of
+                # appearing only if it reaches the end. Rank 0 only, like the
+                # checkpoint above it. Quiet: the "saved ->" line per figure
+                # per epoch would bury the epoch summary.
+                s10.refresh_figures(history, save_dir, f".2{variant}",
+                                    quiet=True)
             agg, n_steps = _fresh_agg(), 0
 
     pbar.close()
@@ -1470,6 +1491,8 @@ def run_stage10_2_training(
         log(f"\n  Stopped at epoch {epoch}, step {global_step}. State saved to "
             f"{lineage.ckpt_path(save_dir, STAGE)}.\n"
             f"  Re-run the same command to continue from exactly here.")
+        if is_main:
+            s10.refresh_figures(history, save_dir, f".2{variant}")
         ddp_cleanup(is_dist)
         return history
 
@@ -1491,9 +1514,7 @@ def run_stage10_2_training(
                 log(line)
         # ".2a" not "2a": the variant is interpolated straight into the
         # filename and the title, so "2a" would read "stage102a".
-        s10._plot_history(history, save_dir, f".2{variant}")
-        s10._plot_tox_alert_rate(history, save_dir, f".2{variant}")
-        s10._plot_validation_properties(history, save_dir, f".2{variant}")
+        s10.refresh_figures(history, save_dir, f".2{variant}")
     ddp_cleanup(is_dist)
     return history
 

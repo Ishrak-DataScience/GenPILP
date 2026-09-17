@@ -110,6 +110,20 @@ Usage
 
 from __future__ import annotations
 
+# FIRST, above torch and transformers: torchao logs a register_constant()
+# deprecation while it is being imported, and a filter installed after that
+# import has nothing left to catch. See quiet_torch_logs for what it drops and
+# what it deliberately does not.
+#
+# Guarded because this module only makes the LOG tidier. A checkout that is
+# missing it -- a partial sync, a `git commit -am` that skipped the untracked
+# file -- must still train; dying at import over two suppressed warning lines
+# would be the worst possible trade.
+try:
+    import quiet_torch_logs  # noqa: F401
+except ImportError:
+    pass
+
 import json
 import os
 import random
@@ -981,6 +995,11 @@ def run_stage10_1_training(
                 save_dir, model, optimizer, epoch + 1, 0,
                 global_step, history, _fresh_agg(), 0, fp,
                 provenance=provenance, profile=profile)
+            # Figures redrawn from the history that was just checkpointed, so
+            # the PNGs on disk track the run epoch by epoch instead of
+            # appearing only if it reaches the end. Quiet: the "saved ->" line
+            # per figure per epoch would bury the epoch summary above it.
+            s10.refresh_figures(history, save_dir, f".1{variant}", quiet=True)
             agg, n_steps = _fresh_agg(), 0
 
     pbar.close()
@@ -990,6 +1009,7 @@ def run_stage10_1_training(
             f"\n  Stopped at epoch {epoch}, step {global_step}. State saved to "
             f"{_ckpt_path(save_dir)}.\n"
             f"  Re-run the same command to continue from exactly here.")
+        s10.refresh_figures(history, save_dir, f".1{variant}")
         return history
 
     # Skipped when an epoch was selected on the held-out fold: those
@@ -1002,11 +1022,9 @@ def run_stage10_1_training(
     else:
         tqdm.write(f"\n  Final model is the epoch with the lowest held-out "
                    f"loss ({best_val:.4f}), already in : {save_dir}")
-    # ".1a" not "1a": these two interpolate the variant directly into the
+    # ".1a" not "1a": this interpolates the variant directly into the
     # filename and the title, so "1a" would read "stage101a".
-    s10._plot_history(history, save_dir, f".1{variant}")
-    s10._plot_tox_alert_rate(history, save_dir, f".1{variant}")
-    s10._plot_validation_properties(history, save_dir, f".1{variant}")
+    s10.refresh_figures(history, save_dir, f".1{variant}")
     return history
 
 

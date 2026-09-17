@@ -108,6 +108,20 @@ Usage
 
 from __future__ import annotations
 
+# FIRST, above torch and transformers: torchao logs a register_constant()
+# deprecation while it is being imported, and a filter installed after that
+# import has nothing left to catch. See quiet_torch_logs for what it drops and
+# what it deliberately does not.
+#
+# Guarded because this module only makes the LOG tidier. A checkout that is
+# missing it -- a partial sync, a `git commit -am` that skipped the untracked
+# file -- must still train; dying at import over two suppressed warning lines
+# would be the worst possible trade.
+try:
+    import quiet_torch_logs  # noqa: F401
+except ImportError:
+    pass
+
 import multiprocessing as mp
 import os
 import sys
@@ -1225,6 +1239,13 @@ def run_stage10_4_training(
                     batch_index=0, global_step=global_step, history=history,
                     agg=_fresh_agg(), n_steps=0, fingerprint=fp,
                     rng=_rng_state(), profile=profile, provenance=provenance)
+                # Figures redrawn from the history that was just checkpointed,
+                # so the PNGs on disk track the run epoch by epoch instead of
+                # appearing only if it reaches the end. Rank 0 only, like the
+                # checkpoint above it. Quiet: six "saved ->" lines per epoch
+                # would bury the epoch summary.
+                s10.refresh_figures(history, save_dir, f".4{variant}",
+                                    extra=_EXTRA_FIGURES, quiet=True)
             agg, n_steps = _fresh_agg(), 0
 
     pbar.close()
@@ -1233,6 +1254,9 @@ def run_stage10_4_training(
         log(f"\n  Stopped at epoch {epoch}, step {global_step}. State saved to "
             f"{lineage.ckpt_path(save_dir, STAGE)}.\n"
             f"  Re-run the same command to continue from exactly here.")
+        if is_main:
+            s10.refresh_figures(history, save_dir, f".4{variant}",
+                                extra=_EXTRA_FIGURES)
         ddp_cleanup(is_dist)
         return history
 
@@ -1247,14 +1271,10 @@ def run_stage10_4_training(
         else:
             log(f"\n  Final model is the epoch with the lowest held-out "
                 f"loss ({best_val:.4f}), already in : {save_dir}")
-        # ".3a" not "3a": the variant is interpolated straight into the
-        # filename and the title, so "3a" would read "stage103a".
-        s10._plot_history(history, save_dir, f".4{variant}")
-        s10._plot_tox_alert_rate(history, save_dir, f".4{variant}")
-        s10._plot_validation_properties(history, save_dir, f".4{variant}")
-        _plot_tox21_clean(history, save_dir, f".4{variant}")
-        _plot_toxicity_comparison(history, save_dir, f".4{variant}")
-        _plot_loss_split(history, save_dir, f".4{variant}")
+        # ".4a" not "4a": the variant is interpolated straight into the
+        # filename and the title, so "4a" would read "stage104a".
+        s10.refresh_figures(history, save_dir, f".4{variant}",
+                            extra=_EXTRA_FIGURES)
     ddp_cleanup(is_dist)
     return history
 
@@ -1264,7 +1284,7 @@ def run_stage10_4_training(
 # ════════════════════════════════════════════════════════════════════════════
 
 def _plot_tox21_clean(history: Dict[str, list], save_dir: str,
-                      variant: str) -> None:
+                      variant: str, quiet: bool = False) -> None:
     """
     Mean Tox21 clean probability against epoch -- the curve this whole stage
     exists to move.
@@ -1313,13 +1333,14 @@ def _plot_tox21_clean(history: Dict[str, list], save_dir: str,
             va="top", ha="left")
     plt.tight_layout()
     out = os.path.join(save_dir, f"stage10{variant}_tox21_clean.png")
-    plt.savefig(out, dpi=150, bbox_inches="tight")
+    s10.savefig_atomic(fig, out)
     plt.close(fig)
-    tqdm.write(f"  Tox21 curve saved     : {out}")
+    if not quiet:
+        tqdm.write(f"  Tox21 curve saved     : {out}")
 
 
 def _plot_toxicity_comparison(history: Dict[str, list], save_dir: str,
-                              variant: str) -> None:
+                              variant: str, quiet: bool = False) -> None:
     """
     The two toxicity notions on one axis: the PAINS/Brenk alert rate (a rule)
     against the Tox21 clean probability (a measurement).
@@ -1365,13 +1386,14 @@ def _plot_toxicity_comparison(history: Dict[str, list], save_dir: str,
     ax.legend(fontsize=8, loc="best")
     plt.tight_layout()
     out = os.path.join(save_dir, f"stage10{variant}_toxicity_comparison.png")
-    plt.savefig(out, dpi=150, bbox_inches="tight")
+    s10.savefig_atomic(fig, out)
     plt.close(fig)
-    tqdm.write(f"  Toxicity comparison   : {out}")
+    if not quiet:
+        tqdm.write(f"  Toxicity comparison   : {out}")
 
 
 def _plot_loss_split(history: Dict[str, list], save_dir: str,
-                     variant: str) -> None:
+                     variant: str, quiet: bool = False) -> None:
     """
     All five weighted terms stacked, so the composite loss can be read as what
     it is: a budget being reallocated.
@@ -1411,9 +1433,18 @@ def _plot_loss_split(history: Dict[str, list], save_dir: str,
     ax.legend(fontsize=8, loc="best")
     plt.tight_layout()
     out = os.path.join(save_dir, f"stage10{variant}_loss_split.png")
-    plt.savefig(out, dpi=150, bbox_inches="tight")
+    s10.savefig_atomic(fig, out)
     plt.close(fig)
-    tqdm.write(f"  Loss split saved      : {out}")
+    if not quiet:
+        tqdm.write(f"  Loss split saved      : {out}")
+
+
+# The three figures this stage adds to s10.refresh_figures' standing three.
+# Defined here, below the functions, so the one list is what both the
+# per-epoch redraw and the end-of-run draw use -- a figure added to this
+# stage cannot end up in one and not the other.
+_EXTRA_FIGURES = (_plot_tox21_clean, _plot_toxicity_comparison,
+                  _plot_loss_split)
 
 
 # ════════════════════════════════════════════════════════════════════════════

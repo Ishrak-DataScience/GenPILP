@@ -29,6 +29,20 @@ What it pins down, in order of what would hurt most if wrong:
 
 from __future__ import annotations
 
+# FIRST, above torch and transformers: torchao logs a register_constant()
+# deprecation while it is being imported, and a filter installed after that
+# import has nothing left to catch. See quiet_torch_logs for what it drops and
+# what it deliberately does not.
+#
+# Guarded because this module only makes the LOG tidier. A checkout that is
+# missing it -- a partial sync, a `git commit -am` that skipped the untracked
+# file -- must still train; dying at import over two suppressed warning lines
+# would be the worst possible trade.
+try:
+    import quiet_torch_logs  # noqa: F401
+except ImportError:
+    pass
+
 import os
 import tempfile
 import warnings
@@ -260,6 +274,42 @@ def run_self_test() -> None:
         assert "stage10b_validation_properties.png" not in os.listdir(td)
     print("  [9] held-out QED/validity/novelty/SA figure written; skipped "
           "cleanly when no validation fold ran   OK")
+
+    # refresh_figures is what 10.1/10.2/10.4 call at every EPOCH BOUNDARY, so
+    # the two things that would hurt are pinned here: that one call writes the
+    # whole standing set (a figure missed at the boundary is a figure the run
+    # does not have until it finishes), and that a figure which raises does
+    # NOT take the training run down with it.
+    import io as _io
+    from contextlib import redirect_stdout
+
+    def _boom(history, save_dir, variant, quiet=False):
+        raise RuntimeError("figure code is broken")
+
+    def _ok(history, save_dir, variant, quiet=False):
+        open(os.path.join(save_dir, f"stage10{variant}_extra.png"), "wb").write(
+            b"not-a-real-png" * 500)
+
+    with tempfile.TemporaryDirectory() as td:
+        noise = _io.StringIO()
+        with redirect_stdout(noise):
+            s10.refresh_figures(hist, td, "b", quiet=True)
+        made = set(os.listdir(td))
+        for expected in ("stage10b_training_curves.png",
+                         "stage10b_tox_alert_rate.png",
+                         "stage10b_validation_properties.png"):
+            assert expected in made, (expected, made)
+        assert noise.getvalue().strip() == "", noise.getvalue()
+
+    with tempfile.TemporaryDirectory() as td:
+        s10.refresh_figures(hist, td, "b", extra=(_boom, _ok))
+        made = set(os.listdir(td))
+        # _ok ran even though _boom raised before it, and the three standing
+        # figures are all there.
+        assert "stage10b_extra.png" in made, made
+        assert "stage10b_training_curves.png" in made, made
+    print("  [10] refresh_figures writes the full set per epoch, stays silent "
+          "when quiet, survives a failing figure   OK")
 
     print("Stage 10 self-test passed.")
 

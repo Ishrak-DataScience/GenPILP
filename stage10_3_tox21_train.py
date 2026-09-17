@@ -118,6 +118,20 @@ uses it as a loss term.
 
 from __future__ import annotations
 
+# FIRST, above torch and transformers: torchao logs a register_constant()
+# deprecation while it is being imported, and a filter installed after that
+# import has nothing left to catch. See quiet_torch_logs for what it drops and
+# what it deliberately does not.
+#
+# Guarded because this module only makes the LOG tidier. A checkout that is
+# missing it -- a partial sync, a `git commit -am` that skipped the untracked
+# file -- must still train; dying at import over two suppressed warning lines
+# would be the worst possible trade.
+try:
+    import quiet_torch_logs  # noqa: F401
+except ImportError:
+    pass
+
 import json
 import math
 import os

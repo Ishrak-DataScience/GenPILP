@@ -102,11 +102,25 @@ Usage
 
 from __future__ import annotations
 
+# FIRST, above torch and transformers: torchao logs a register_constant()
+# deprecation while it is being imported, and a filter installed after that
+# import has nothing left to catch. See quiet_torch_logs for what it drops and
+# what it deliberately does not.
+#
+# Guarded because this module only makes the LOG tidier. A checkout that is
+# missing it -- a partial sync, a `git commit -am` that skipped the untracked
+# file -- must still train; dying at import over two suppressed warning lines
+# would be the worst possible trade.
+try:
+    import quiet_torch_logs  # noqa: F401
+except ImportError:
+    pass
+
 import json
 import os
 import random
 import sys
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import matplotlib
 matplotlib.use("Agg")
@@ -850,13 +864,73 @@ def run_stage10_training(
                    "of whichever stages trained it. Provenance:)")
         for line in lineage.provenance_table(provenance):
             tqdm.write(line)
-    _plot_history(history, save_dir, variant)
-    _plot_tox_alert_rate(history, save_dir, variant)
-    _plot_validation_properties(history, save_dir, variant)
+    refresh_figures(history, save_dir, variant)
     return history
 
 
-def _plot_history(history: Dict[str, list], save_dir: str, variant: str) -> None:
+def savefig_atomic(fig, out: str, **kwargs) -> None:
+    """
+    Write a figure through a temp file in the same directory, then one
+    os.replace onto the final name.
+
+    These PNGs are now rewritten at every epoch boundary of a run that takes
+    hours, which means they are read WHILE they are being written -- scp'd off
+    the server, opened from a mounted share, picked up by a sync client. A
+    plain savefig truncates the old file first and fills it over the following
+    moments, so a reader that arrives in that window gets a half-written PNG
+    and no way to tell it apart from a finished one. os.replace is atomic on
+    the same filesystem, so a reader sees either the previous epoch's figure
+    or this one, never a fragment.
+    """
+    kwargs.setdefault("dpi", 150)
+    kwargs.setdefault("bbox_inches", "tight")
+    tmp = out + ".tmp.png"
+    try:
+        fig.savefig(tmp, **kwargs)
+        os.replace(tmp, out)
+    finally:
+        # A render that raised half way leaves the partial temp behind; the
+        # caller retries next epoch, and a directory of stale .tmp.png files
+        # is exactly the confusion this function exists to prevent.
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def refresh_figures(history: Dict[str, list], save_dir: str, variant: str,
+                    extra: Sequence[Callable] = (), quiet: bool = False) -> None:
+    """
+    Draw every standing figure for this run from the history collected so far.
+
+    Called at each EPOCH BOUNDARY as well as at the end, so a run that is
+    still going -- or one that was interrupted, or one whose final eval pass
+    never ran -- always has current PNGs on disk beside its checkpoint. The
+    figures are a pure function of `history`, which is exactly what the
+    checkpoint stores, so redrawing them mid-run costs one matplotlib render
+    (~1 s against a multi-hour epoch) and can never disagree with the state
+    that was saved.
+
+    `extra` takes the per-stage figures a script adds on top of these three;
+    each is called with the same (history, save_dir, variant, quiet=) contract.
+
+    Every figure is drawn inside its own try/except: a plotting failure at
+    epoch 3 of 30 must not end a run whose weights are fine. The failure is
+    reported and the next figure is attempted.
+    """
+    figures = (_plot_history, _plot_tox_alert_rate,
+               _plot_validation_properties, *extra)
+    for fn in figures:
+        try:
+            fn(history, save_dir, variant, quiet=quiet)
+        except Exception as exc:                       # noqa: BLE001
+            tqdm.write(f"  (figure {getattr(fn, '__name__', fn)} failed: "
+                       f"{type(exc).__name__}: {exc})")
+
+
+def _plot_history(history: Dict[str, list], save_dir: str, variant: str,
+                  quiet: bool = False) -> None:
     """Training curves. Loss DESCENDS here, unlike Stage 9's ascending score."""
     if not history.get("epoch"):
         return
@@ -895,13 +969,14 @@ def _plot_history(history: Dict[str, list], save_dir: str, variant: str) -> None
                  f"(no reinforcement learning)", fontsize=13)
     plt.tight_layout()
     out = os.path.join(save_dir, f"stage10{variant}_training_curves.png")
-    plt.savefig(out, dpi=150, bbox_inches="tight")
+    savefig_atomic(fig, out)
     plt.close(fig)
-    tqdm.write(f"  Training curves saved : {out}")
+    if not quiet:
+        tqdm.write(f"  Training curves saved : {out}")
 
 
 def _plot_validation_properties(history: Dict[str, list], save_dir: str,
-                                variant: str) -> None:
+                                variant: str, quiet: bool = False) -> None:
     """
     The four properties the objective optimises, on the HELD-OUT fold:
     QED, candidate validity, novelty and synthetic accessibility.
@@ -973,8 +1048,9 @@ def _plot_validation_properties(history: Dict[str, list], save_dir: str,
 
     if drawn == 0:
         plt.close(fig)
-        tqdm.write("  (no held-out series in history; validation-property "
-                   "figure skipped)")
+        if not quiet:
+            tqdm.write("  (no held-out series in history; validation-property "
+                       "figure skipped)")
         return
 
     fig.suptitle(f"Stage 10{variant} -- held-out molecule properties per epoch",
@@ -986,13 +1062,14 @@ def _plot_validation_properties(history: Dict[str, list], save_dir: str,
              ha="center", fontsize=8, color="#555555")
     plt.tight_layout()
     out = os.path.join(save_dir, f"stage10{variant}_validation_properties.png")
-    plt.savefig(out, dpi=150, bbox_inches="tight")
+    savefig_atomic(fig, out)
     plt.close(fig)
-    tqdm.write(f"  Held-out property curves saved : {out}")
+    if not quiet:
+        tqdm.write(f"  Held-out property curves saved : {out}")
 
 
 def _plot_tox_alert_rate(history: Dict[str, list], save_dir: str,
-                         variant: str) -> None:
+                         variant: str, quiet: bool = False) -> None:
     """
     Toxicity alert rate against epoch -- the single curve the toxicity
     question actually asks about: what fraction of the molecules this stage
@@ -1051,9 +1128,10 @@ def _plot_tox_alert_rate(history: Dict[str, list], save_dir: str,
                  "derived from", fontsize=9, color="#555555")
     plt.tight_layout()
     out = os.path.join(save_dir, f"stage10{variant}_tox_alert_rate.png")
-    plt.savefig(out, dpi=150, bbox_inches="tight")
+    savefig_atomic(fig, out)
     plt.close(fig)
-    tqdm.write(f"  Toxicity alert-rate curve saved : {out}")
+    if not quiet:
+        tqdm.write(f"  Toxicity alert-rate curve saved : {out}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
